@@ -1,9 +1,9 @@
-"""Наблюдатель за новыми листингами MEXC: сам запускает пробу API и запись рынка.
+"""Наблюдатель за новыми листингами MEXC: уведомления в Telegram, проба API и запись рынка.
 
-Раз в --interval секунд берёт полный /api/v3/exchangeInfo и ищет:
-  * пары со status != 1 (будущий листинг: так выглядели WFIUSDT и MTOUSDT за сутки до старта);
-  * пары, которых не было при первом запуске (листинг, пропущенный на стадии status=2).
-Для каждой такой пары запускает отдельными процессами:
+Раз в --interval секунд берёт полный /api/v3/exchangeInfo и передаёт его ListingTracker (tools/listings.py):
+будущие пары (status != 1), время старта (firstOpenTime), перенос и снятие листинга.
+О каждом событии по парам с котировкой из --notify-quotes пишет в Telegram (получатели — TG_LISTING_CHAT_ID,
+если не задан — TG_CHAT_ID). Для каждой отслеживаемой пары запускает отдельными процессами:
   tools/probe_listing.py SYMBOL --open auto ...   — проверки API и пробный ордер
   tools/listing_recorder.py SYMBOL ...            — запись всех WS-потоков и REST-снимков
 Процессы запускаются в своей сессии и переживают перезапуск наблюдателя.
@@ -22,8 +22,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from listings import ListingTracker, format_event
 from notify import notify
-from probe_listing import ROOT, Client, load_dotenv
+from probe_listing import ROOT, Client, load_dotenv, now_ms
 
 HERE = Path(__file__).resolve().parent
 LOGS = ROOT / "logs"
@@ -44,13 +45,16 @@ class Watcher:
         self.args = args
         self.client = Client(None, None, 15.0)
         self.state = self.load_state()
+        self.state.pop("known", None)  # новые пары теперь определяет ListingTracker по firstOpenTime
+        self.tracker = ListingTracker(self.state.setdefault("listings", {}), self.state.setdefault("ignored", {}),
+                                      remind_ms=int(args.remind_min * 60_000))
         self.children: list[subprocess.Popen] = []
 
     def load_state(self) -> dict:
         try:
             return json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return {"known": [], "handled": {}}
+            return {"handled": {}}
 
     def save_state(self) -> None:
         tmp = STATE_PATH.with_suffix(".tmp")
@@ -68,7 +72,7 @@ class Watcher:
         self.children.append(proc)
         log(f"{symbol}: запущен {script} (pid {proc.pid})")
 
-    def launch(self, symbol: str, info: dict, reason: str) -> None:
+    def launch(self, symbol: str, info: dict) -> None:
         a = self.args
         probe_args = ["--open", "auto", "--duration", str(a.duration), "--max-wait", str(a.max_wait)]
         if a.real_order:
@@ -78,15 +82,17 @@ class Watcher:
         self.spawn("probe", "probe_listing.py", symbol, probe_args)
         self.spawn("rec", "listing_recorder.py", symbol,
                    ["--duration", str(a.duration), "--max-wait", str(a.max_wait)])
-        self.state["handled"][symbol] = {"ts": int(time.time() * 1000), "reason": reason,
-                                         "status": info.get("status"), "zones": info.get("conceptPlates")}
+        self.state["handled"][symbol] = {"ts": now_ms(), "status": info.get("status"),
+                                         "firstOpenTime": info.get("firstOpenTime"), "zones": info.get("conceptPlates")}
         self.save_state()
-        notify(f"🆕 {symbol} ({info.get('fullName')}, {', '.join(info.get('conceptPlates') or [])}): "
-               f"{reason}. Запущены проба API и запись рынка.\nhttps://www.mexc.com/exchange/{info.get('baseAsset')}_{info.get('quoteAsset')}")
 
     def has_trades(self, symbol: str) -> bool:
         r = self.client.call("GET", "/api/v3/trades", {"symbol": symbol, "limit": 1})
-        return r.ok and isinstance(r.body, list) and len(r.body) > 0
+        found = r.ok and isinstance(r.body, list) and len(r.body) > 0
+        if found:
+            # status≠1 у пары с историей сделок — приостановка или делистинг, а не новый листинг
+            log(f"{symbol}: status≠1, но сделки уже были — не листинг, пропускаю")
+        return found
 
     def active_count(self) -> int:
         self.children = [p for p in self.children if p.poll() is None]  # заодно убираем завершённые
@@ -98,36 +104,25 @@ class Watcher:
             log(f"exchangeInfo: {r.label()}")
             return
         symbols = {s["symbol"]: s for s in r.body.get("symbols", [])}
-        first_run = not self.state["known"]
-        known = set(self.state["known"])
-        ignored = self.state.setdefault("ignored", {})
         # пара исчезла (листинг отменён/перенесён, делистинг) — если её процессы завершены, забываем её,
         # чтобы при повторном появлении запустить пробу заново
-        for sym in [s for s in list(self.state["handled"]) + list(ignored) if s not in symbols]:
+        for sym in [s for s in self.state["handled"] if s not in symbols]:
             if not is_running("probe_listing.py", sym) and not is_running("listing_recorder.py", sym):
-                self.state["handled"].pop(sym, None)
-                ignored.pop(sym, None)
+                del self.state["handled"][sym]
                 log(f"{sym}: пары больше нет в exchangeInfo — снята с учёта")
-        for sym, info in symbols.items():
-            if sym in self.state["handled"] or sym in ignored:
-                continue
-            if info.get("status") != "1":
-                if self.has_trades(sym):
-                    # status=2 у пары с историей сделок — приостановка или делистинг, а не новый листинг
-                    ignored[sym] = {"ts": int(time.time() * 1000), "status": info.get("status")}
-                    log(f"{sym}: status={info.get('status')}, но сделки уже были — не листинг, пропускаю")
-                    continue
-                reason = f"будущий листинг (status={info.get('status')}, tradeSideType={info.get('tradeSideType')})"
-            elif not first_run and sym not in known:
-                reason = "новая пара появилась сразу открытой"
-            else:
+        now = now_ms()
+        for ev in self.tracker.update(symbols, now, self.has_trades):
+            text = format_event(ev, now)
+            log(f"{ev.symbol}: {text.splitlines()[0]}")
+            if ev.quote in self.args.notify_quotes:
+                notify(text, to="TG_LISTING_CHAT_ID")
+        for sym in self.tracker.tracked:
+            if sym in self.state["handled"] or sym not in symbols:
                 continue
             if self.active_count() >= self.args.max_active * 2:
                 log(f"{sym}: лимит одновременных процессов, отложено")
-                continue
-            log(f"{sym}: {reason}")
-            self.launch(sym, info, reason)
-        self.state["known"] = sorted(known | set(symbols))
+                break
+            self.launch(sym, symbols[sym])
         self.save_state()
 
     def run(self) -> None:
@@ -147,6 +142,9 @@ def main() -> None:
     p.add_argument("--duration", type=float, default=3600, help="секунд пробы и записи после открытия (3600)")
     p.add_argument("--max-wait", type=float, default=72, help="сколько часов ждать открытия пары (72)")
     p.add_argument("--max-active", type=int, default=6, help="сколько пар обрабатывать одновременно (6)")
+    p.add_argument("--notify-quotes", type=lambda s: s.upper().split(","), default=["USDT"],
+                   help="о парах с какими котировками писать в Telegram, через запятую (USDT)")
+    p.add_argument("--remind-min", type=float, default=5, help="напоминание в Telegram за N минут до старта, 0 — нет (5)")
     p.add_argument("--real-order", action="store_true", help="пробный реальный LIMIT BUY с отменой в каждой пробе")
     p.add_argument("--real-order-every", type=float, default=10, help="не чаще одной попытки ордера за N секунд (10)")
     p.add_argument("--market-test", action="store_true",
