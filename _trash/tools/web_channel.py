@@ -117,6 +117,7 @@ async ([url, opts]) => {
 
 @dataclass
 class WebResp:
+    """Ответ request сайта: code / data / msg из его JSON или error, если запрос не дошёл до ответа."""
     code: int | None
     data: object
     msg: str | None
@@ -126,9 +127,11 @@ class WebResp:
 
     @property
     def ok(self) -> bool:
+        """Запрос дошёл, и сайт ответил code 0 или 200."""
         return self.error is None and self.code in (0, 200)
 
     def label(self) -> str:
+        """Коротко для вывода: OK, ERR <code> <msg> или NET <ошибка>."""
         if self.error:
             return f"NET {self.error}"
         return "OK" if self.ok else f"ERR {self.code} {self.msg}"
@@ -156,6 +159,10 @@ def dec_str(x, scale: int | None = None) -> str:
 
 
 class WebChannel:
+    """Залогиненный браузер на странице пары и вызовы API сайта через его функцию request.
+    Порядок: start() (или launch() + open_pair()), затем call() / place_*() / cancel(), в конце close().
+    profile_dir — профиль Chromium с cookies сессии, headless — без окна, lite — облегчённая страница (make_lite)."""
+
     def __init__(self, profile_dir: Path = PROFILE_DIR, headless: bool = False, lite: bool = True):
         self.profile_dir = profile_dir
         self.headless = headless
@@ -194,10 +201,13 @@ class WebChannel:
         await self.open_pair(page_symbol, ready_timeout)
 
     async def has_session_cookie(self) -> bool:
+        """Есть ли в профиле cookie сессии. Жива ли сессия, проверяет is_logged_in()."""
         # u_id — токен сессии; им же сайт подписывает ордера (x-mxc-sign)
         return any(c["name"] == "u_id" and c["value"] for c in await self.ctx.cookies(SITE))
 
     async def open_pair(self, page_symbol: str, ready_timeout: float = 30) -> None:
+        """Открывает страницу пары (page_symbol вида MX_USDT) и находит на ней request сайта.
+        В облегчённом режиме с окном кладёт поверх пустую вкладку."""
         await self.page.goto(f"{SITE}/exchange/{page_symbol}", wait_until="domcontentloaded")
         await self.inject(ready_timeout)
         if self.lite and not self.headless:
@@ -208,6 +218,8 @@ class WebChannel:
             await self._front.bring_to_front()
 
     async def inject(self, timeout: float = 30) -> dict:
+        """Находит request сайта (INJECT_JS) и сохраняет его в window.__mxweb.
+        Возвращает, где он найден: {moduleId, via}. Не нашёл за timeout секунд — исключение."""
         # чанки сайта догружаются после domcontentloaded — пробуем, пока request не появится в кэше
         deadline = time.monotonic() + timeout
         while True:
@@ -220,12 +232,16 @@ class WebChannel:
                 await asyncio.sleep(0.5)
 
     async def close(self) -> None:
+        """Закрывает браузер и Playwright. Профиль с сессией остаётся на диске."""
         if self.ctx:
             await self.ctx.close()
         if self._pw:
             await self._pw.stop()
 
     async def call(self, url: str, method: str = "GET", body: dict | None = None, **opts) -> WebResp:
+        """Вызывает request сайта в странице. url — путь API сайта (с query), body — JSON тела,
+        opts — прочие опции request (headers, needDolos). Сообщений об ошибках сайт не показывает.
+        Если request в странице не найден (страница перезагрузилась), находит его заново и повторяет вызов."""
         req = {"method": method, "showErrorMsg": False, **opts}
         if body is not None:
             req["body"] = body
@@ -246,6 +262,7 @@ class WebChannel:
     # --- данные ---
 
     async def load_symbols(self) -> int:
+        """Загружает все пары из symbolsV2 в self.symbols и возвращает их число."""
         r = await self.call(SYMBOLS_URL)
         if not r.ok or not isinstance(r.data, dict):
             raise RuntimeError(f"symbolsV2: {r.label()}")
@@ -257,6 +274,8 @@ class WebChannel:
         return len(self.symbols)
 
     async def symbol(self, symbol: str) -> SymbolInfo:
+        """Данные пары по имени как в официальном API (MXUSDT). Если пары нет в загруженном списке,
+        перечитывает symbolsV2. Если её нет и там — KeyError."""
         if symbol not in self.symbols:
             await self.load_symbols()  # новая пара могла появиться после прошлой загрузки
         if symbol not in self.symbols:
@@ -264,15 +283,19 @@ class WebChannel:
         return self.symbols[symbol]
 
     async def balance(self, currency: str) -> WebResp:
+        """Спотовый баланс одной монеты (data.available и др.). Без входа — ошибка 401."""
         return await self.call(f"{BALANCE_URL}?currency={currency}")
 
     async def is_logged_in(self) -> bool:
+        """Сессия жива, если сайт отдаёт баланс USDT."""
         r = await self.balance("USDT")
         return r.ok and isinstance(r.data, dict) and "available" in r.data
 
     # --- ордера ---
 
     async def place_limit(self, symbol: str, side: str, price, quantity) -> WebResp:
+        """LIMIT-ордер тем же запросом, что кнопка Buy/Sell. side — BUY или SELL; price и quantity
+        округляются вниз до точности пары. В data ответа — id ордера (C02__…)."""
         s = await self.symbol(symbol)
         body = {"currencyId": s.cd, "marketCurrencyId": s.mcd, "tradeType": side.upper(),
                 "price": dec_str(price, s.price_scale), "quantity": dec_str(quantity, s.qty_scale),
@@ -294,6 +317,7 @@ class WebChannel:
         return await self.call(PLACE_MARKET_URL, "POST", body, headers=ORDER_HEADERS, needDolos=DOLOS_SCENE)
 
     async def cancel(self, order_id: str) -> WebResp:
+        """Отмена ордера по id (C02__…); подпись сайт для неё не требует."""
         return await self.call(f"{CANCEL_URL}?orderId={order_id}", "DELETE")
 
 
@@ -309,6 +333,7 @@ def book_ticker(symbol: str) -> tuple[float, float]:
 
 
 async def cmd_login(args) -> None:
+    """Команда login: окно браузера для входа. Ждёт cookie сессии, затем проверяет вход запросом баланса."""
     # Пока человек входит, страницу не трогаем: форма входа — другие страницы и редиректы,
     # а вызовы JS на уходящей странице падают. Ждём cookie сессии, потом проверяем вход запросом.
     wc = WebChannel(headless=False, lite=False)  # форме входа нужны капча и картинки
@@ -360,6 +385,8 @@ def load_cookie_file(path: Path) -> list[dict]:
 
 
 async def cmd_import_cookies(args) -> None:
+    """Команда import-cookies: переносит сессию из экспорта cookies в профиль и проверяет вход.
+    Без --keep файл экспорта удаляется."""
     path = Path(args.file)
     cookies = load_cookie_file(path)
     if not any(c["name"] == "u_id" for c in cookies):
@@ -383,6 +410,7 @@ async def cmd_import_cookies(args) -> None:
 
 
 async def cmd_check(args) -> None:
+    """Команда check, без ордеров: время запуска, где найден request, данные пары, балансы, вход."""
     wc = WebChannel(headless=args.headless, lite=not args.full)
     t0 = time.perf_counter()
     await wc.start(args.page)
@@ -398,6 +426,8 @@ async def cmd_check(args) -> None:
 
 
 async def cmd_limit_test(args) -> None:
+    """Команда limit-test: прогревает страницу, ставит РЕАЛЬНЫЙ LIMIT BUY на --usdt на --below % ниже bid
+    и сразу его отменяет. Печатает ответы и задержки."""
     wc = WebChannel(headless=args.headless, lite=not args.full)
     await wc.start(args.page)
     s = await wc.symbol(args.symbol)
