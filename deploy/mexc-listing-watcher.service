@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 User=ubuntu
 WorkingDirectory=/home/ubuntu/mexc-bot
-ExecStart=/home/ubuntu/mexc-bot/.venv/bin/python -u tools/listing_watcher.py --real-order --market-test
+ExecStart=/home/ubuntu/mexc-bot/.venv/bin/python -u tools/listing_watcher.py --real-order --market-test --cap-test
 Restart=always
 RestartSec=10
 # Пробы и записи — дочерние процессы в своих сессиях: при перезапуске службы они должны доработать

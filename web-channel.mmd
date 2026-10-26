@@ -1,0 +1,62 @@
+---
+references:
+  - "File: /_trash/tools/web_channel.py"
+generationTime: 2026-10-23T08:53:37.157Z
+---
+flowchart TD
+    A(["CLI main entry"]) --> B{"Select command"}
+
+    B -->|login| C["launch browser<br/>lite false"]
+    C --> D{"session cookie exists?"}
+    D -->|No| E["open login page"]
+    E --> F["wait for session cookie"]
+    F --> G["wait for redirects"]
+    D -->|Yes| H["open trading page"]
+    G --> H
+    H --> I["inject website request"]
+    I --> J{"session active?"}
+    J -->|Yes| K["check USDT balance"]
+    J -->|No| L["request manual login again"]
+    K --> M(["close browser"])
+    L --> M
+
+    B -->|import-cookies| N["load and validate cookie file"]
+    N --> O{"u_id cookie present?"}
+    O -->|No| P["raise configuration error"]
+    O -->|Yes| Q["launch browser and import cookies"]
+    Q --> R["open trading page and inject request"]
+    R --> S["check login and USDT balance"]
+    S --> T{"keep export file?"}
+    T -->|No| U["delete cookie export file"]
+    T -->|Yes| V["preserve export file"]
+    U --> W(["close browser"])
+    V --> W
+    P --> W
+
+    B -->|check| X["start browser and trading page"]
+    X --> Y["retry injection until request found"]
+    Y --> Z["load symbol metadata"]
+    Z --> AA["query quote and base balances"]
+    AA --> AB["check session status"]
+    AB --> AC(["close browser"])
+
+    B -->|limit-test| AD["start browser and trading page"]
+    AD --> AE["load symbol metadata"]
+    AE --> AF["wait warm-up period"]
+    AF --> AG["request market ticker"]
+    AG --> AH["fetch public bid price"]
+    AH --> AI["calculate below-market price and quantity"]
+    AI --> AJ["place limit BUY"]
+    AJ --> AK{"order successful?"}
+    AK -->|Yes| AL{"order data has ID?"}
+    AL -->|No| AM["skip cancellation"]
+    AL -->|Yes| AN["cancel order"]
+    AK -->|No| AM
+    AN --> AO(["close browser"])
+    AM --> AO
+
+    X -.-> AP["WebChannel start loop"]
+    AD -.-> AP
+    AP["launch browser"] --> AQ["open pair page"]
+    AQ --> AR["make lite page optimizations"]
+    AR --> Y

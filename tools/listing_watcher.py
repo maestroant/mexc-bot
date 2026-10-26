@@ -79,6 +79,8 @@ class Watcher:
             probe_args += ["--real-order", "--real-order-every", str(a.real_order_every)]
         if a.market_test:
             probe_args += ["--market-test"]
+        if a.cap_test:
+            probe_args += ["--cap-test"]
         self.spawn("probe", "probe_listing.py", symbol, probe_args)
         self.spawn("rec", "listing_recorder.py", symbol,
                    ["--duration", str(a.duration), "--max-wait", str(a.max_wait)])
@@ -149,6 +151,7 @@ def main() -> None:
     p.add_argument("--real-order-every", type=float, default=10, help="не чаще одной попытки ордера за N секунд (10)")
     p.add_argument("--market-test", action="store_true",
                    help="в каждой пробе: MARKET BUY/SELL на 5 USDT (проверка рыночных ордеров через API)")
+    p.add_argument("--cap-test", action="store_true", help="в каждой пробе: проверки потолка цены на открытии")
     args = p.parse_args()
     LOGS.mkdir(exist_ok=True)
     load_dotenv(ROOT / ".env")

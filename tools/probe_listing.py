@@ -18,6 +18,16 @@
                  MARKET BUY на --market-test-usdt, LIMIT SELL половины на --market-test-far-pct ниже
                  bid (пропустит ли защита цены PERCENT_PRICE_BY_SIDE), MARKET SELL остатка; если
                  MARKET SELL отклонён — запасной выход LIMIT-ами по bid −2 %. Пишется проскальзывание и PnL.
+  cap_*, preopen_* (--cap-test) потолок цены на открытии, со status=1 до T + --cap-window с:
+                 public_prices  ticker/price, avgPrice, свеча 1m, ticker/24hr — когда появляется openPrice
+                                (базовая цена листинга; у замороженных листингов потолок был ровно ×10);
+                 cap_order_test order/test BUY выше вероятного потолка — отвечает ли тестовый эндпоинт 30010;
+                 с --real-order, раз в --cap-order-every с, ордер на минимум пары и сразу отмена:
+                 preopen_low    до открытия LIMIT BUY вдвое ниже нижнего ask — принимает ли биржа ордера заранее;
+                 preopen_cap    до открытия LIMIT BUY выше видимых asks — проверяется ли потолок заранее
+                                (оба не ближе минуты к firstOpenTime);
+                 cap_maker      после открытия LIMIT_MAKER BUY выше потолка — 30010 с точным потолком.
+                 Потолок из каждого 30010 (_extend.price) и openPrice попадают в итог.
 
 В консоль печатаются только смены состояния каждой проверки, всё остальное
 пишется в logs/probe_<SYMBOL>_<время>.jsonl.
@@ -40,6 +50,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -203,6 +214,12 @@ class Probe:
         self.market_test_done = False  # MARKET-тест делается один раз
         self.last_market_attempt = 0.0
         self.market_stats: dict[int, dict[str, int]] = {}  # ответы на MARKET BUY по минутам
+        self.first_open_ms: int | None = None  # firstOpenTime из exchangeInfo (последнее непустое)
+        self.last_price = Decimal(0)  # ticker/price
+        self.open_price: tuple[int, str] | None = None  # (когда впервые, openPrice из ticker/24hr)
+        self.caps: list[tuple[int, str, str]] = []  # (время, проверка, _extend.price из ответа 30010)
+        self.last_cap_check = 0.0
+        self.last_cap_order = 0.0
         self.log_path = log_path
         self.log = log_path.open("a", encoding="utf-8")
 
@@ -246,6 +263,7 @@ class Probe:
             s = symbols[0]
             self.market.info = s
             self.online = s.get("status") == "1"
+            self.first_open_ms = s.get("firstOpenTime") or self.first_open_ms  # пропадает, когда status мигает
             state = (f"listed status={s.get('status')} apiAllowed={s.get('isSpotTradingAllowed')} "
                      f"side={s.get('tradeSideType')} types={','.join(s.get('orderTypes', []))}")
             self.record("exchange_info", r, state, s.get("isSpotTradingAllowed") is True, {"symbol_info": s})
@@ -277,8 +295,9 @@ class Probe:
             best = {"bid": self.market.bids[0] if self.market.bids else None,
                     "ask": self.market.asks[0] if self.market.asks else None}
             self.record("depth", r, state, state == "ok", best)
-            # у приостановленной старой пары (status=2) стакан тоже двусторонний — это не открытие
-            if state == "ok" and self.open_ms is None and self.online:
+            # у приостановленной старой пары (status=2) стакан тоже двусторонний — это не открытие;
+            # до firstOpenTime bid может быть нашей же заявкой preopen_* — тоже не открытие
+            if state == "ok" and self.open_ms is None and self.online and self.after_scheduled_open():
                 self.detect_open("two_sided_book")
         else:
             self.record("depth", r, r.label(), False, {"body": r.body})
@@ -397,6 +416,7 @@ class Probe:
         """Ставит ордер, пишет результат в check, возвращает orderId или None."""
         params = {**params, "symbol": self.symbol, "newClientOrderId": f"{check[:6]}{now_ms()}"}
         r = self.client.call("POST", "/api/v3/order", params, signed=True)
+        self.note_cap(check, r)
         order_id = r.body.get("orderId") if r.ok and isinstance(r.body, dict) else None
         self.record(check, r, "ACCEPTED" if order_id else r.label(), bool(order_id),
                     {"params": params, "body": r.body,
@@ -530,6 +550,140 @@ class Probe:
                 self.client.call("DELETE", "/api/v3/order", {"symbol": self.symbol, "orderId": fb_id}, signed=True)
         return received
 
+    # --- потолок цены на открытии (--cap-test) ----------------------------------
+
+    def after_scheduled_open(self) -> bool:
+        """Наступило ли время старта из exchangeInfo (firstOpenTime); если его нет — считаем, что да."""
+        return not self.first_open_ms or now_ms() + self.client.time_offset_ms >= self.first_open_ms - 2000
+
+    def note_cap(self, check: str, r: Resp) -> None:
+        """Запоминает потолок из ответа 30010: {"code": 30010, "_extend": {"price": "0.025USDT"}}."""
+        if isinstance(r.body, dict) and r.body.get("code") == 30010:
+            self.caps.append((now_ms(), check, str((r.body.get("_extend") or {}).get("price", ""))))
+
+    def check_public_prices(self) -> None:
+        """Публичные цены пары: появляется ли openPrice (ticker/24hr) и другие цены до открытия."""
+        sym = {"symbol": self.symbol}
+        calls = (("price", "/api/v3/ticker/price", sym), ("avg", "/api/v3/avgPrice", sym),
+                 ("kline", "/api/v3/klines", {**sym, "interval": "1m", "limit": 1}),
+                 ("ticker24h", "/api/v3/ticker/24hr", sym))
+        bodies, parts, open_price = {}, [], None
+        for name, path, params in calls:
+            r = self.client.call("GET", path, params)
+            bodies[name] = r.body
+            if not r.ok:
+                parts.append(f"{name}={r.label()}")
+            elif name == "kline":
+                parts.append(f"kline_open={r.body[-1][1] if isinstance(r.body, list) and r.body else 'нет'}")
+            elif name == "ticker24h" and isinstance(r.body, dict):
+                open_price = r.body.get("openPrice")
+                parts.append(f"openPrice={open_price}")
+            elif isinstance(r.body, dict):
+                price = Decimal(str(r.body.get("price") or 0))
+                if name == "price" and price > 0:
+                    self.last_price = price
+                parts.append(f"{name}={'есть' if price > 0 else '0'}")  # само значение — в логе
+        has_open = bool(open_price) and Decimal(str(open_price)) > 0
+        if has_open and self.open_price is None:
+            self.open_price = (now_ms(), str(open_price))
+        self.record("public_prices", None, " ".join(parts), has_open, {"bodies": bodies})
+
+    def cap_ref_price(self) -> Decimal | None:
+        """Цена, выше которой ставится проверочный BUY. Во время заморозки лучший bid и последняя цена стоят
+        на потолке; до открытия bid-ов нет — берётся верх видимых asks (у RT, MTO, HDLR, CHOMP он был не ниже потолка)."""
+        if self.market.bids:
+            return max(Decimal(self.market.bids[0][0]), self.last_price)
+        if self.market.asks:
+            return max(Decimal(p) for p, _ in self.market.asks)
+        return None
+
+    def cap_buy_params(self, order_type: str, price: Decimal | None) -> dict | None:
+        """BUY на минимальную сумму пары (+10 %) по цене price, округлённой вниз до точности пары."""
+        if not price:
+            return None
+        price_dec, qty_dec, min_amount = self.precisions()
+        price = price.quantize(Decimal(1).scaleb(-price_dec), ROUND_DOWN)
+        if price <= 0:
+            return None
+        qty = (min_amount * Decimal("1.1") / price).quantize(Decimal(1).scaleb(-qty_dec), ROUND_UP)
+        return {"side": "BUY", "type": order_type, "quantity": str(qty), "price": str(price)}
+
+    def above_cap_price(self) -> Decimal | None:
+        ref = self.cap_ref_price()
+        return ref * (1 + Decimal(str(self.args.cap_test_pct)) / 100) if ref else None
+
+    def check_cap_order_test(self) -> None:
+        """order/test BUY выше вероятного потолка: проверяет ли тестовый эндпоинт потолок (30010). Без риска."""
+        params = self.cap_buy_params("LIMIT", self.above_cap_price())
+        if params is None:
+            self.record("cap_order_test", None, "skipped: no book", False)
+            return
+        params["symbol"] = self.symbol
+        r = self.client.call("POST", "/api/v3/order/test", params, signed=True)
+        self.note_cap("cap_order_test", r)
+        is_cap = isinstance(r.body, dict) and r.body.get("code") == 30010
+        self.record("cap_order_test", r, "ACCEPTED" if r.ok else r.label(), is_cap, {"params": params, "body": r.body})
+
+    def check_preopen_orders(self) -> None:
+        """До открытия: принимает ли биржа ордера (LIMIT BUY вдвое ниже нижнего ask) и проверяет ли уже потолок
+        (LIMIT BUY выше видимых asks). Принятый ордер сразу отменяется. Ближе минуты к firstOpenTime не ставим."""
+        if not self.market.asks or not self.first_open_ms:
+            return
+        if self.first_open_ms - (now_ms() + self.client.time_offset_ms) < 60_000:
+            return
+        low = self.cap_buy_params("LIMIT", Decimal(self.market.asks[0][0]) / 2)
+        high = self.cap_buy_params("LIMIT", self.above_cap_price())
+        for check, params in (("preopen_low", low), ("preopen_cap", high)):
+            if params and (order_id := self.place(check, params)):
+                self.cancel_order(order_id)
+
+    def check_cap_maker(self) -> None:
+        """После открытия: LIMIT_MAKER BUY выше вероятного потолка. «Только мейкер» не покупает по рынку:
+        во время заморозки ждём 30010 с точным потолком, без неё — отказ, потому что ордер исполнился бы сразу.
+        Если ордер всё же встал в стакан (широкий спред), он сразу отменяется."""
+        params = self.cap_buy_params("LIMIT_MAKER", self.above_cap_price())
+        if params and (order_id := self.place("cap_maker", params)):
+            self.cancel_order(order_id)
+
+    def check_cap(self) -> None:
+        """Проверки потолка: со status=1 до открытия и --cap-window секунд после."""
+        rel = self.rel()
+        if rel is not None and rel > self.args.cap_window * 1000:
+            return
+        now = time.monotonic()
+        if now - self.last_cap_check >= self.args.cap_every:
+            self.last_cap_check = now
+            self.check_public_prices()
+            if self.client.has_keys:
+                self.check_cap_order_test()
+        if (self.args.real_order and not self.real_order_halted
+                and now - self.last_cap_order >= self.args.cap_order_every):
+            self.last_cap_order = now
+            if self.open_ms is None:
+                self.check_preopen_orders()
+            else:
+                self.check_cap_maker()
+
+    def cap_lines(self) -> list[str]:
+        """Итог по потолку: openPrice и каждое значение потолка из 30010 — когда видели и в каких проверках."""
+        lines = []
+        if self.open_price:
+            lines.append(f"openPrice {self.open_price[1]} (впервые {self.fmt(self.open_price[0]).strip()})")
+        seen: dict[str, list[tuple[int, str]]] = {}
+        for ts, check, raw in self.caps:
+            seen.setdefault(raw, []).append((ts, check))
+        for raw, items in seen.items():
+            m = re.match(r"[0-9.]+", raw)
+            ratio = ""
+            if m and self.open_price and Decimal(self.open_price[1]) > 0:
+                ratio = f" = {Decimal(m.group()) / Decimal(self.open_price[1]):.2f} × openPrice"
+            checks = ", ".join(sorted({c for _, c in items}))
+            lines.append(f"потолок {raw}{ratio}: {self.fmt(items[0][0]).strip()} … {self.fmt(items[-1][0]).strip()}, "
+                         f"30010 ×{len(items)} ({checks})")
+        if self.args.cap_test and not seen:
+            lines.append("30010 не было")
+        return lines
+
     # --- цикл -----------------------------------------------------------------
 
     def tick(self) -> None:
@@ -543,6 +697,8 @@ class Probe:
                 self.check_real_order()
             if self.args.market_test:
                 self.check_market_test()
+        if self.args.cap_test:
+            self.check_cap()
 
     def run(self) -> None:
         last_heartbeat = 0.0
@@ -579,7 +735,10 @@ class Probe:
             lines.append(f"{check:<13} первый успех: {first:<12} последнее: {st.last}")
         stats = self.order_stats_lines()
         market_stats = self.order_stats_lines(self.market_stats)
+        cap = self.cap_lines()
         print("\n=== Итог (T — время относительно открытия) ===\n" + "\n".join(lines))
+        if cap:
+            print("\nПотолок цены:\n" + "\n".join(cap))
         if stats:
             print("\nПробные ордера по минутам (OK — принят, 10007 — пара закрыта для API):\n" + "\n".join(stats))
         if market_stats:
@@ -594,9 +753,12 @@ class Probe:
                        for c, s in self.states.items()},
             "order_stats": self.order_stats,
             "market_stats": self.market_stats,
+            "caps": self.caps,
+            "open_price": self.open_price,
         }}, ensure_ascii=False) + "\n")
         self.log.close()
         notify(f"📋 Проба {self.symbol} завершена\n" + "\n".join(lines)
+               + ("\nПотолок цены:\n" + "\n".join(cap) if cap else "")
                + ("\nОрдера по минутам:\n" + "\n".join(stats[-15:]) if stats else "")
                + f"\nЛог: {self.log_path.name}")
 
@@ -645,6 +807,14 @@ def main() -> None:
                    help="делать тест только при спреде не больше N %% (10)")
     p.add_argument("--market-test-far-pct", type=float, default=50.0,
                    help="LIMIT SELL половины на N %% ниже bestBid — проверка защиты цены (50)")
+    p.add_argument("--cap-test", action="store_true",
+                   help="проверки потолка цены на открытии (cap_*, preopen_*; реальные ордера — только с --real-order)")
+    p.add_argument("--cap-window", type=float, default=700, help="проверять потолок N секунд после открытия (700)")
+    p.add_argument("--cap-every", type=float, default=10.0, help="публичные цены и order/test раз в N секунд (10)")
+    p.add_argument("--cap-order-every", type=float, default=30.0,
+                   help="реальные ордера проверки потолка раз в N секунд (30)")
+    p.add_argument("--cap-test-pct", type=float, default=10.0,
+                   help="BUY «выше потолка» на N %% выше лучшего bid / последней цены (10; защита цены биржи — 20)")
     p.add_argument("--usdt", type=float, default=2.0, help="объём пробного ордера в USDT (2.0, не меньше минимума пары)")
     p.add_argument("--offset-pct", type=float, default=10.0, help="на сколько %% ниже bestBid ставить пробный BUY (10)")
     p.add_argument("--timeout", type=float, default=5.0, help="таймаут HTTP-запроса, с (5)")

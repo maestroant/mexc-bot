@@ -66,6 +66,7 @@ class Recorder:
         self.client = client
         self.started_ms = now_ms()
         self.open_ms: int | None = None
+        self.first_open_ms: int | None = None  # firstOpenTime из exchangeInfo (последнее непустое)
         self.online = False  # status == 1 в exchangeInfo
         self.absent_since: int | None = None  # с какого момента пары нет в exchangeInfo
         self.stop = asyncio.Event()
@@ -92,6 +93,10 @@ class Recorder:
         self.write("event", name, info)
         print(f"[{datetime.now():%H:%M:%S}] {self.sym} {name} {info if info else ''}", flush=True)
 
+    def after_scheduled_open(self) -> bool:
+        """Наступило ли время старта из exchangeInfo (firstOpenTime); если его нет — считаем, что да."""
+        return not self.first_open_ms or self.t() >= self.first_open_ms - 2000
+
     def mark_open(self, reason: str) -> None:
         if self.open_ms is None:
             self.open_ms = self.t()
@@ -115,8 +120,10 @@ class Recorder:
                 bt = data.get("publicAggreBookTicker", {})
                 if deals:
                     self.mark_open("first_deal")
-                # у приостановленной старой пары (status=2) стакан тоже двусторонний — это не открытие
-                elif self.online and float(bt.get("bidPrice") or 0) > 0 and float(bt.get("askPrice") or 0) > 0:
+                # у приостановленной старой пары (status=2) стакан тоже двусторонний — это не открытие;
+                # до firstOpenTime bid может быть пробной заявкой probe_listing (preopen_*) — тоже не открытие
+                elif (self.online and self.after_scheduled_open()
+                      and float(bt.get("bidPrice") or 0) > 0 and float(bt.get("askPrice") or 0) > 0):
                     self.mark_open("two_sided_book")
         else:
             try:
@@ -196,6 +203,7 @@ class Recorder:
                         return
                 elif symbols:
                     self.absent_since = None
+                    self.first_open_ms = symbols[0].get("firstOpenTime") or self.first_open_ms
                 if status == "1" and not self.online:
                     self.online = True
                     self.event("STATUS_ONLINE", api_allowed=symbols[0].get("isSpotTradingAllowed"))
