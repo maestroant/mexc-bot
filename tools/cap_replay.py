@@ -593,17 +593,22 @@ def profiles_for(mode: str) -> list[Profile]:
     return [CAP_DYNAMIC[mode], CAP_NO_TIME[mode], LEGACY]
 
 
-def run_listing(path: Path, args, caps: dict) -> list[dict]:
+def run_listing(path: Path, args, caps: dict) -> tuple[list[dict], dict]:
+    """Прогон одной записи: строки результатов по веткам и сведения о листинге (потолок, снятие)."""
     symbol = path.name.split("_")[1]
+    meta = dict(symbol=symbol, status="no_cap", zones="", cap=None, src=None, release_ms=None, open_ms=None)
     cap_src = caps.get(symbol) or find_cap(symbol)
     if not cap_src:
-        print(f"{symbol}: нет потолка (ни 30010 в логе пробы, ни --cap) — пропуск")
-        return []
+        if not args.summary_only:
+            print(f"{symbol}: нет потолка (ни 30010 в логе пробы, ни --cap) — пропуск")
+        return [], meta
     cap, src = cap_src
+    meta.update(status="not_released", cap=cap, src=src)
     open_ms, cand_ms, events, info = load(path, cap)
     if not events:
-        print(f"{symbol}: потолок {cap} так и не снят в записи — пропуск")
-        return []
+        if not args.summary_only:
+            print(f"{symbol}: потолок {cap} так и не снят в записи — пропуск")
+        return [], meta
     step = 10 ** -int(info.get("quotePrecision") or 8)
     qty_step = 10 ** -int(info.get("baseAssetPrecision") or 8)
     zones = ", ".join(info.get("conceptPlates") or [])
@@ -635,6 +640,7 @@ def run_listing(path: Path, args, caps: dict) -> list[dict]:
         if s.state != "DONE":
             s.finish(t_end, "END_OF_DATA")
     rows = []
+    meta.update(zones=zones, open_ms=open_ms, release_ms=release, status="released" if release else "not_released")
     if not args.summary_only:
         head = (f"\n=== {symbol} [{zones}] потолок {cap} ({src}), первая сделка выше потолка "
                 f"T+{(cand_ms - open_ms) / 1000:.3f} с, CAP_RELEASED T+{(release - open_ms) / 1000:.3f} с"
@@ -661,7 +667,37 @@ def run_listing(path: Path, args, caps: dict) -> list[dict]:
               + (f", к exitVWAP {gap:+.2f} %" if gap is not None else "")
               + f", остаток {r['left_usdt']:.3f} USDT, комиссии {r['fees_usdt']:.4f}; "
               f"глубина min ×{r['min_depth07_x']:.0f} (0,7 %) / ×{r['min_depth15_x']:.0f} (1,5 %)  [{r['detail']}]")
-    return rows
+    return rows, meta
+
+
+PROFILE_LABEL = {"CAP_DYNAMIC": "CAP_DYNAMIC", "CAP_NO_TIME_STOPS": "без врем. стопов", "LEGACY_STOPS": "LEGACY"}
+
+
+def brief(meta: dict, rows: list[dict], latency: int) -> str:
+    """Короткий итог одного листинга для Telegram (наблюдатель шлёт его после записи замороженного листинга)."""
+    head = f"📊 REPLAY CAP BREAKOUT — {meta['symbol']}" + (f" [{meta['zones']}]" if meta["zones"] else "")
+    if meta["status"] == "no_cap":
+        return f"{head}\nПотолка нет (30010 не было) — листинг не замороженный"
+    if meta["status"] == "not_released":
+        return f"{head}\nПотолок {meta['cap']} ({meta['src']}) за время записи не снят — входа нет"
+    lines = [head, f"Потолок {meta['cap']} ({meta['src']}), снят на T+{(meta['release_ms'] - meta['open_ms']) / 1000:.0f} с"]
+    for mode in ENTRY:
+        rs = [r for r in rows if r["mode"] == mode and r["latency"] == latency]
+        if not rs:
+            continue
+        if "entry_ms" not in rs[0]:
+            top = sorted(rs[0].get("skips", {}).items(), key=lambda x: -x[1])[:2]
+            lines.append(f"{mode}: нет входа ({', '.join(k for k, _ in top) or rs[0].get('reason')})")
+            continue
+        r0 = rs[0]
+        lines.append(f"{mode}: вход через {(r0['entry_ms'] - meta['release_ms']) / 1000:.1f} с "
+                     f"по {r0['entry_px'] / meta['cap']:.2f}× потолка")
+        for r in rs:
+            left = f", остаток {r['left_usdt']:.2f} USDT" if r["left_usdt"] >= 0.01 else ""
+            lines.append(f"  {PROFILE_LABEL[r['profile']]}: {r['pnl_pct']:+.2f} % "
+                         f"({r['reason']}, {r['hold_s']:.0f} с{left})")
+    lines.append(f"10 USDT на вход, задержка {latency} мс; модель упрощённая — см. doc/cap_breakout_resheniya.md")
+    return "\n".join(lines)
 
 
 def summary(rows: list[dict]) -> None:
@@ -701,6 +737,7 @@ def main() -> None:
     p.add_argument("--pre-buy-drop", action="store_true",
                    help="не покупать, если bid-VWAP за 1 с упал на порог «падения bid-VWAP» профиля (FAST −4, CONFIRMED −3)")
     p.add_argument("--summary-only", action="store_true", help="печатать только итог")
+    p.add_argument("--brief", action="store_true", help="только короткий итог по каждому листингу (для Telegram)")
     p.add_argument("--json", help="сохранить строки результатов в JSON")
     args = p.parse_args()
     args.latency = [int(x) for x in args.latency.split(",")]
@@ -709,10 +746,15 @@ def main() -> None:
     for c in args.cap:
         sym, val = c.split("=")
         caps[sym.upper()] = (float(val), "--cap")
+    args.summary_only |= args.brief
     rows = []
     for f in args.files:
-        rows += run_listing(Path(f), args, caps)
-    summary(rows)
+        listing_rows, meta = run_listing(Path(f), args, caps)
+        rows += listing_rows
+        if args.brief:
+            print(brief(meta, listing_rows, args.latency[0]))
+    if not args.brief:
+        summary(rows)
     if args.json:
         Path(args.json).write_text(json.dumps(rows, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
 

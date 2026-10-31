@@ -8,6 +8,8 @@
   tools/listing_recorder.py SYMBOL ...            — запись всех WS-потоков и REST-снимков
 Процессы запускаются в своей сессии и переживают перезапуск наблюдателя.
 Если для пары процесс уже работает (например, запущенный вручную), второй не запускается.
+Когда проба и запись пары закончились, а в логе пробы есть 30010 (листинг был заморожен потолком цены),
+наблюдатель прогоняет tools/cap_replay.py --brief по записи и шлёт итог REPLAY CAP BREAKOUT в Telegram.
 
 Состояние — logs/watcher_state.json, вывод процессов — logs/<probe|rec>_<SYMBOL>_console.txt.
 Запуск: .venv/bin/python tools/listing_watcher.py   (обычно как systemd-служба mexc-listing-watcher)
@@ -22,6 +24,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from cap_replay import find_cap
 from listings import ListingTracker, format_event
 from notify import notify
 from probe_listing import ROOT, Client, load_dotenv, now_ms
@@ -85,8 +88,29 @@ class Watcher:
         self.spawn("rec", "listing_recorder.py", symbol,
                    ["--duration", str(a.duration), "--max-wait", str(a.max_wait)])
         self.state["handled"][symbol] = {"ts": now_ms(), "status": info.get("status"),
-                                         "firstOpenTime": info.get("firstOpenTime"), "zones": info.get("conceptPlates")}
+                                         "firstOpenTime": info.get("firstOpenTime"), "zones": info.get("conceptPlates"),
+                                         "replay": "pending"}
         self.save_state()
+
+    def check_replays(self) -> None:
+        """Проба и запись пары закончились, в логе пробы есть 30010 — REPLAY CAP BREAKOUT по записи, итог в Telegram."""
+        for sym, h in self.state["handled"].items():
+            if h.get("replay") != "pending":
+                continue
+            if is_running("probe_listing.py", sym) or is_running("listing_recorder.py", sym):
+                continue
+            h["replay"] = "done"
+            recs = sorted(LOGS.glob(f"rec_{sym}_2*.jsonl.gz"))
+            if not recs or not find_cap(sym):
+                continue  # листинг не был заморожен
+            r = subprocess.run([sys.executable, str(HERE / "cap_replay.py"), str(recs[-1]), "--brief"],
+                               cwd=ROOT, capture_output=True, text=True, timeout=600)
+            text = r.stdout.strip()
+            if r.returncode != 0 or not text:
+                log(f"{sym}: REPLAY CAP BREAKOUT не удался: {r.stderr.strip()[-300:]}")
+                continue
+            log(f"{sym}: REPLAY CAP BREAKOUT — {' | '.join(text.splitlines()[1:])}")
+            notify(text)
 
     def has_trades(self, symbol: str) -> bool:
         r = self.client.call("GET", "/api/v3/trades", {"symbol": symbol, "limit": 1})
@@ -125,6 +149,7 @@ class Watcher:
                 log(f"{sym}: лимит одновременных процессов, отложено")
                 break
             self.launch(sym, symbols[sym])
+        self.check_replays()
         self.save_state()
 
     def run(self) -> None:
