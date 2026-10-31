@@ -1,0 +1,314 @@
+<?xml version="1.0" ?>
+<mxfile host="app.diagrams.net" modified="2026-10-27T18:00:00Z" agent="ChatGPT" version="24.7.17" type="device">
+  <diagram id="1" name="Общая карта">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="3628" pageHeight="1852" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="2" value="&lt;b&gt;1 Новый листинг&lt;/b&gt;&lt;br/&gt;• Получить symbol, время, tick/qty step и комиссии&lt;br/&gt;• Подключить WS: deals, bookTicker, diff-depth&lt;br/&gt;• Собрать локальный стакан; открыть ledger" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6FD;strokeColor=#0C87D1;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="160" width="850" height="480" as="geometry"/>
+        </mxCell>
+        <mxCell id="3" value="&lt;b&gt;2 Определить потолок&lt;/b&gt;&lt;br/&gt;• Подтвердить capPrice: источник + время&lt;br/&gt;• Ошибка 30010 может содержать верхнюю границу&lt;br/&gt;• order/test и плоская цена НЕ доказывают cap" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F8EF;strokeColor=#12A360;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="940" y="160" width="850" height="480" as="geometry"/>
+        </mxCell>
+        <mxCell id="4" value="&lt;b&gt;3 Ожидать разблокировку&lt;/b&gt;&lt;br/&gt;• Мониторить сделки и bid/ask непрерывно&lt;br/&gt;• T+600 — лишь ориентир для известных 10 минут&lt;br/&gt;• При потере depth sequence — BOOK_RECOVERY" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7DC;strokeColor=#E2A115;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1838" y="160" width="850" height="480" as="geometry"/>
+        </mxCell>
+        <mxCell id="5" value="&lt;b&gt;4 Подтвердить снятие&lt;/b&gt;&lt;br/&gt;• Реальная сделка строго выше capPrice&lt;br/&gt;• BestBid тоже выше capPrice + шаг цены&lt;br/&gt;• Стакан свежий и синхронизированный" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1ECFF;strokeColor=#7552C7;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2736" y="160" width="850" height="480" as="geometry"/>
+        </mxCell>
+        <mxCell id="6" value="&lt;b&gt;5 Выбрать алгоритм&lt;/b&gt;&lt;br/&gt;• В LIVE активен только FAST ИЛИ CONFIRMED&lt;br/&gt;• Проверить позиции и неизвестные ордера&lt;br/&gt;• В REPLAY обе стратегии независимы" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E4F7F4;strokeColor=#149B95;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2736" y="716" width="850" height="480" as="geometry"/>
+        </mxCell>
+        <mxCell id="7" value="&lt;b&gt;6A FAST BREAKOUT&lt;/b&gt;&lt;br/&gt;• Сканировать подходящий стакан максимум 10 с&lt;br/&gt;• Без 200 мс стабилизации, но с depth/VWAP&lt;br/&gt;• Проверить spread, stress-loss, chase" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2E7;strokeColor=#E77826;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1838" y="716" width="850" height="480" as="geometry"/>
+        </mxCell>
+        <mxCell id="8" value="&lt;b&gt;6B CONFIRMED BREAKOUT&lt;/b&gt;&lt;br/&gt;• Сканировать не дольше 30 с&lt;br/&gt;• Все фильтры стабильны ≥200 мс&lt;br/&gt;• Требовать ≥3 независимых обновления" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6FD;strokeColor=#0C87D1;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="940" y="716" width="850" height="480" as="geometry"/>
+        </mxCell>
+        <mxCell id="9" value="&lt;b&gt;7 LIMIT BUY&lt;/b&gt;&lt;br/&gt;• price ≤ bestAsk × 1.01; qty по orderUSDT&lt;br/&gt;• Покупка одна: timeout 1200 мс&lt;br/&gt;• Cancel/reconcile остатка; partial → ledger" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F8EF;strokeColor=#12A360;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="716" width="850" height="480" as="geometry"/>
+        </mxCell>
+        <mxCell id="10" value="&lt;b&gt;8 TP1 / TP2 и fills&lt;/b&gt;&lt;br/&gt;• TP1 +2% на 50%; TP2 +4% на остаток&lt;br/&gt;• Важны fills, не касания цен; minNotional&lt;br/&gt;• После любого SELL → обновить R, Q, fees" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1ECFF;strokeColor=#7552C7;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="1272" width="850" height="480" as="geometry"/>
+        </mxCell>
+        <mxCell id="11" value="&lt;b&gt;9 Защита общего PnL&lt;/b&gt;&lt;br/&gt;• C = все BUY + fee; R = SELL после fee&lt;br/&gt;• Остаток оценивается по exitVWAP и stress&lt;br/&gt;• После частичного TP — BE/LOCK по всей сделке" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7DC;strokeColor=#E2A115;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="940" y="1272" width="850" height="480" as="geometry"/>
+        </mxCell>
+        <mxCell id="12" value="&lt;b&gt;10 Срочная продажа&lt;/b&gt;&lt;br/&gt;• Cancel TP → сверить fills → вычислить Q&lt;br/&gt;• Aggressive LIMIT SELL, до 3 перестановок&lt;br/&gt;• Критический fallback; никаких слепых дублей" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF0EF;strokeColor=#D85257;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1838" y="1272" width="850" height="480" as="geometry"/>
+        </mxCell>
+        <mxCell id="13" value="&lt;b&gt;11 Завершение&lt;/b&gt;&lt;br/&gt;• Q=0 и все SELL имеют известный статус&lt;br/&gt;• PnL только по реальным сделкам и fee&lt;br/&gt;• Сохранить причины, slippage и полный REPLAY" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6FD;strokeColor=#0C87D1;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2736" y="1272" width="850" height="480" as="geometry"/>
+        </mxCell>
+        <mxCell id="e1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="2" target="3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="3" target="4">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="4" target="5">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="5" target="6">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="6" target="7">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="8" target="9">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e7" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="9" target="10">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e8" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="10" target="11">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e9" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="11" target="12">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e10" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="12" target="13">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e11" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="6" target="8">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e12" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="7" target="9">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="2" name="FAST">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="3285" pageHeight="2038" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="2" value="&lt;b&gt;A1 Снятие подтверждено&lt;/b&gt;&lt;br/&gt;• Получить CAP_RELEASED и releaseEventId&lt;br/&gt;• Открыть FAST окно: 10 секунд&lt;br/&gt;• Есть другая позиция/ордер? → SKIP" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6FD;strokeColor=#0C87D1;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="160" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="3" value="&lt;b&gt;A2 Свежий стакан&lt;/b&gt;&lt;br/&gt;• Получить bestBid, bestAsk, diff-depth&lt;br/&gt;• Возраст ≤250 мс, нет потерь sequence&lt;br/&gt;• Нет → восстановить и дождаться обновления" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7DC;strokeColor=#E2A115;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1125" y="160" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="4" value="&lt;b&gt;A3 Проверка ликвидности&lt;/b&gt;&lt;br/&gt;• Spread ≤1.2%; нужный объём asks&lt;br/&gt;• Bid07 ≥15×; Bid15 ≥30×; Ask07 ≥8×&lt;br/&gt;• Нет → ждать до FAST deadline" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F8EF;strokeColor=#12A360;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2208" y="160" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="5" value="&lt;b&gt;A4 Проверка выхода&lt;/b&gt;&lt;br/&gt;• Рассчитать exitVWAP на ВСЮ qty&lt;br/&gt;• Slippage depth ≤1.5% + отдельный stress&lt;br/&gt;• Если нет покупателей → BUY запрещён" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1ECFF;strokeColor=#7552C7;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2208" y="621" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="6" value="&lt;b&gt;A5 Цена не убежала&lt;/b&gt;&lt;br/&gt;• Рассчитать buyVWAP и контроль chase&lt;br/&gt;• Price cap от bestAsk +1%&lt;br/&gt;• Нет → не повышать LIMIT вслед за рынком" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2E7;strokeColor=#E77826;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1125" y="621" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="7" value="&lt;b&gt;A6 Повторная проверка&lt;/b&gt;&lt;br/&gt;• Актуальные bid/ask и ордера перед отправкой&lt;br/&gt;• minQty/minNotional и остаточный риск&lt;br/&gt;• Нет → следующий снимок до дедлайна" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6FD;strokeColor=#0C87D1;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="621" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="8" value="&lt;b&gt;A7 Отправить BUY&lt;/b&gt;&lt;br/&gt;• Один LIMIT BUY и уникальный clientOrderId&lt;br/&gt;• Не делать вторую попытку на этом событии&lt;br/&gt;• Timeout создания → ORDER_UNKNOWN" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F8EF;strokeColor=#12A360;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="1082" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="9" value="&lt;b&gt;A8 Исполнение BUY&lt;/b&gt;&lt;br/&gt;• Ждать до 1200 мс или полный fill&lt;br/&gt;• Partial → отменить неполученный остаток&lt;br/&gt;• Нет fill → SKIP; UNKNOWN → RECONCILE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1ECFF;strokeColor=#7552C7;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1125" y="1082" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="10" value="&lt;b&gt;A9 Фактическая позиция&lt;/b&gt;&lt;br/&gt;• Исполненная qty, фактическая средняя BUY&lt;br/&gt;• Комиссии, minNotional для TP1 и TP2&lt;br/&gt;• DUST/недопустимые лоты → отдельный риск" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7DC;strokeColor=#E2A115;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2208" y="1082" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="11" value="&lt;b&gt;A10 Старт TP и PnL&lt;/b&gt;&lt;br/&gt;• Поставить допустимые TP1/TP2&lt;br/&gt;• Считать C, R, Q, exitVWAP и stress&lt;br/&gt;• Любой fill SELL запускает пересчёт" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E4F7F4;strokeColor=#149B95;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2208" y="1543" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="12" value="&lt;b&gt;A11 Защита / выход&lt;/b&gt;&lt;br/&gt;• TP1 partial → пересчитать P_BE/P_LOCK&lt;br/&gt;• При угрозе общего PnL → cancel TP&lt;br/&gt;• Aggressive LIMIT SELL → fallback" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF0EF;strokeColor=#D85257;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1125" y="1543" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="13" value="&lt;b&gt;A12 Финал FAST&lt;/b&gt;&lt;br/&gt;• Только после Q=0 и сверки ордеров&lt;br/&gt;• Сохранить actual slippage, PnL, причины&lt;br/&gt;• Иначе RESIDUAL_OPEN / MANUAL_REVIEW" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6FD;strokeColor=#0C87D1;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="1543" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="e1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="2" target="3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="3" target="4">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="4" target="5">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="5" target="6">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="6" target="7">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="7" target="8">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e7" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="8" target="9">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e8" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="9" target="10">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e9" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="10" target="11">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e10" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="11" target="12">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e11" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="12" target="13">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="3" name="CONFIRMED">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="3285" pageHeight="2038" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="2" value="&lt;b&gt;B1 CAP_RELEASED&lt;/b&gt;&lt;br/&gt;• Открыть CONFIRMED окно на 30 секунд&lt;br/&gt;• Создать счётчики stableSince и updates&lt;br/&gt;• Конфликт позиции → SKIP" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6FD;strokeColor=#0C87D1;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="160" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="3" value="&lt;b&gt;B2 Новая рыночная порция&lt;/b&gt;&lt;br/&gt;• Принимать только реальные новые WS события&lt;br/&gt;• Проверять sequence и возраст ≤500 мс&lt;br/&gt;• Gap → восстановить стакан; reset" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7DC;strokeColor=#E2A115;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1125" y="160" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="4" value="&lt;b&gt;B3 Все фильтры сразу&lt;/b&gt;&lt;br/&gt;• Spread ≤1.2%; bid07 ≥15×, bid15 ≥30×&lt;br/&gt;• Ask07 ≥8×; exit slip ≤1.5%&lt;br/&gt;• Любой fail → обнулить stableSince" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F8EF;strokeColor=#12A360;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2208" y="160" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="5" value="&lt;b&gt;B4 Проверить устойчивость&lt;/b&gt;&lt;br/&gt;• Непрерывное выполнение ≥200 мс&lt;br/&gt;• ≥3 разных bookVersion/WS обновления&lt;br/&gt;• Таймеры пересчёта НЕ считаются событиями" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1ECFF;strokeColor=#7552C7;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2208" y="621" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="6" value="&lt;b&gt;B5 Сценарный риск&lt;/b&gt;&lt;br/&gt;• BuyVWAP, exitVWAP и будущий stress&lt;br/&gt;• Проверить цену, разворот, резерв риска&lt;br/&gt;• Нет → сбросить streak/ждать" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2E7;strokeColor=#E77826;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1125" y="621" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="7" value="&lt;b&gt;B6 Pre-send проверка&lt;/b&gt;&lt;br/&gt;• Перед LIMIT BUY обновить bid/ask/qty&lt;br/&gt;• Не догонять цену и не превышать cap BUY&lt;br/&gt;• Если плохой рынок → возврат к B2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6FD;strokeColor=#0C87D1;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="621" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="8" value="&lt;b&gt;B7 Единственный BUY&lt;/b&gt;&lt;br/&gt;• LIMIT по bestAsk +1%; qty по USDT&lt;br/&gt;• Уникальный clientOrderId&lt;br/&gt;• Неотвеченный API → RECONCILE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F8EF;strokeColor=#12A360;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="1082" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="9" value="&lt;b&gt;B8 Контроль fills&lt;/b&gt;&lt;br/&gt;• До 1200 мс; cancel оставшуюся заявку&lt;br/&gt;• Partial → только фактический объём&lt;br/&gt;• Zero fill → SKIP, без повторного BUY" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1ECFF;strokeColor=#7552C7;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1125" y="1082" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="10" value="&lt;b&gt;B9 Управление остатком&lt;/b&gt;&lt;br/&gt;• TP1/TP2 после minNotional проверки&lt;br/&gt;• Оценка полного PnL после каждого fill&lt;br/&gt;• Не считать касание тейка исполнением" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7DC;strokeColor=#E2A115;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2208" y="1082" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="11" value="&lt;b&gt;B10 Общая защита&lt;/b&gt;&lt;br/&gt;• C/R/Q, стрессовый exitVWAP и P_BE&lt;br/&gt;• TP1 исполнен частично → защита слабее&lt;br/&gt;• Если целевая прибыль под угрозой → EXIT" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E4F7F4;strokeColor=#149B95;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2208" y="1543" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="12" value="&lt;b&gt;B11 Urgent SELL&lt;/b&gt;&lt;br/&gt;• Cancel TP и сверка fills, затем новый Q&lt;br/&gt;• LIMIT SELL / bounded cancel-reprice&lt;br/&gt;• UNKNOWN никогда не дублировать" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF0EF;strokeColor=#D85257;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1125" y="1543" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="13" value="&lt;b&gt;B12 Финал CONFIRMED&lt;/b&gt;&lt;br/&gt;• Deadline без стабильности → SKIP&lt;br/&gt;• После входа закрытие только Q=0&lt;br/&gt;• Сохранить исполнение, риски, slippage" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6FD;strokeColor=#0C87D1;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="1543" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="e1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="2" target="3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="3" target="4">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="4" target="5">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="5" target="6">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="6" target="7">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="7" target="8">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e7" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="8" target="9">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e8" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="9" target="10">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e9" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="10" target="11">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e10" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="11" target="12">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e11" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="12" target="13">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+  <diagram id="4" name="TP, PnL и выход">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="3285" pageHeight="2038" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="2" value="&lt;b&gt;P1 BUY заполнился&lt;/b&gt;&lt;br/&gt;• Зафиксировать фактические fills и комиссии&lt;br/&gt;• C = стоимость BUY + fees&lt;br/&gt;• Q = реально доступное количество" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6FD;strokeColor=#0C87D1;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="160" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="3" value="&lt;b&gt;P2 Поставить TP&lt;/b&gt;&lt;br/&gt;• TP1: +2% на 50%; TP2: +4% на Q-остаток&lt;br/&gt;• До постановки проверить minNotional/qtyStep&lt;br/&gt;• Реальное достижение TP = SELL fill" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F8EF;strokeColor=#12A360;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1125" y="160" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="4" value="&lt;b&gt;P3 Каждое исполнение&lt;/b&gt;&lt;br/&gt;• Получен SELL fill → R увеличивается&lt;br/&gt;• Q уменьшается на фактическое qty&lt;br/&gt;• Повтор события по ID игнорируется" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1ECFF;strokeColor=#7552C7;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2208" y="160" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="5" value="&lt;b&gt;P4 Рассчитать exitVWAP&lt;/b&gt;&lt;br/&gt;• По bids для ВСЕГО оставшегося Q&lt;br/&gt;• Если bids не хватает → DEPTH_DISAPPEARED&lt;br/&gt;• Текущие spread+depth уже учтены" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7DC;strokeColor=#E2A115;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2208" y="621" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="6" value="&lt;b&gt;P5 Общий прогноз&lt;/b&gt;&lt;br/&gt;• FullPnL = R + Q×exitVWAP×(1-fee) − C&lt;br/&gt;• StressPNL добавляет возможный extra slip&lt;br/&gt;• При Q=0 → только фактический PnL" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E4F7F4;strokeColor=#149B95;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1125" y="621" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="7" value="&lt;b&gt;P6 Проверка TP1&lt;/b&gt;&lt;br/&gt;• TP1 полностью? частично? не исполнен?&lt;br/&gt;• Для 20 из 50 проданных R от 20, Q от 80&lt;br/&gt;• Каждый partial меняет защитный P_BE" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF2E7;strokeColor=#E77826;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="621" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="8" value="&lt;b&gt;P7 Общая защита&lt;/b&gt;&lt;br/&gt;• После положительного partial SELL активировать&lt;br/&gt;• Цель всей сделки 0% или +0.5% (тест)&lt;br/&gt;• StressFullPnL ≤ цель → срочный выход" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7DC;strokeColor=#E2A115;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="1082" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="9" value="&lt;b&gt;P8 Уровень P_BE&lt;/b&gt;&lt;br/&gt;• P_BE=(C−R)/(Q×(1−sellFee))&lt;br/&gt;• P_LOCK: вместо C берём C×(1+цель)&lt;br/&gt;• requiredVWAP=P_LOCK/(1−stress)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#F1ECFF;strokeColor=#7552C7;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1125" y="1082" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="10" value="&lt;b&gt;P9 Приоритет риска&lt;/b&gt;&lt;br/&gt;• HARD_STOP, dump, no depth → немедленный EXIT&lt;br/&gt;• Time stop или BE/TotalPnL guard → EXIT&lt;br/&gt;• Нельзя гарантировать продажу в плюс" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF0EF;strokeColor=#D85257;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2208" y="1082" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="11" value="&lt;b&gt;P10 Cancel + reconcile&lt;/b&gt;&lt;br/&gt;• Запретить конкурирующие ордера&lt;br/&gt;• Отменить TP1/TP2 и учесть новые fills&lt;br/&gt;• Новый Q = BUY − все фактические SELL" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#EAF6FD;strokeColor=#0C87D1;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="2208" y="1543" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="12" value="&lt;b&gt;P11 Продать остаток&lt;/b&gt;&lt;br/&gt;• Aggressive LIMIT SELL; ждать до 400 мс&lt;br/&gt;• До 3 перестановок с cancel+verify&lt;br/&gt;• Не получилось → проектный fallback" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF0EF;strokeColor=#D85257;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="1125" y="1543" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="13" value="&lt;b&gt;P12 Финальная сверка&lt;/b&gt;&lt;br/&gt;• Q=0 + все ордера известны → CLOSED&lt;br/&gt;• Есть dust/UNKNOWN → RESIDUAL_OPEN&lt;br/&gt;• PnL, исполнения и слippage в журнал" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E8F8EF;strokeColor=#12A360;fontSize=20;spacing=20;align=left;verticalAlign=top;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="42" y="1543" width="1035" height="395" as="geometry"/>
+        </mxCell>
+        <mxCell id="e1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="2" target="3">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="3" target="4">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="4" target="5">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="5" target="6">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="6" target="7">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="7" target="8">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e7" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="8" target="9">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e8" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="9" target="10">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e9" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="10" target="11">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e10" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="11" target="12">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e11" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;endArrow=block;endFill=1;strokeWidth=3;strokeColor=#4F778F;" edge="1" parent="1" source="12" target="13">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

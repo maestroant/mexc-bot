@@ -1,0 +1,56 @@
+capBreakout:
+  enabled: false
+  environment: REPLAY                # REPLAY | PAPER | LIVE
+  liveEntryMode: CONFIRMED            # FAST | CONFIRMED | DISABLED
+  cap:
+    requireEvidence: true
+    expectedDurationSec: 600          # только если режим подтверждён
+    requireTradeAboveCap: true
+    requireBidAboveCap: true
+  order:
+    orderUSDT: 10
+    buyAggressiveCapPct: 1.0
+    buyFillTimeoutMs: 1200
+    exitOrderTimeoutMs: 400
+    maxExitReprices: 3
+    forbidUnknownOrderRetry: true
+    maxEntriesPerRelease: 1
+  commonFilters:
+    maxSpreadPct: 1.2
+    minDepthBid07x: 15
+    minDepthBid15x: 30
+    minDepthAsk07x: 8
+    maxEstimatedExitSlippagePct: 1.5
+    maxTickPct: 0.3
+    maxChasePct: 20                  # сравнить 10/20/40, anchor=releaseReferenceAsk
+    maxEntryStressLossPct: 3.0        # сравнить 1/3/5, только REPLAY-гипотеза
+    slippageStressPct: 0.5          # исследовательский буфер, НЕ гарантия
+  fast:
+    entryWindowSec: 10
+    stabilizationMs: 0
+    maxBookAgeMs: 250
+  confirmed:
+    entryWindowSec: 30
+    stabilizationMs: 200
+    minDistinctBookUpdates: 3
+    maxBookAgeMs: 500
+  tp:
+    tp1Pct: 2.0
+    tp1QtyPct: 50
+    tp2Pct: 4.0
+    validateEachLegMinNotional: true
+    smallPositionPolicy: SINGLE_TP_OR_SKIP
+  totalPnlProtection:
+    enabledAfterRealPositivePartialSell: true
+    targetFullPnLPct: 0.0           # также тестировать +0.5
+    useStressedExitVWAP: true
+    whenUnattainable: EXIT_NOW        # альтернативу тестировать отдельно
+  exit:
+    useExistingPositionManager: true
+    criticalFallback: RequestSellOrderMinPrice
+    netPnLBasis: TOTAL_POSITION
+    maxHoldSec: 15
+  logging:
+    recordRawWs: true
+    recordAllOrderAndFillEvents: true
+    logDecisionsPerMode: true
