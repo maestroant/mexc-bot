@@ -10,6 +10,8 @@
 Если для пары процесс уже работает (например, запущенный вручную), второй не запускается.
 Когда проба и запись пары закончились, а в логе пробы есть 30010 (листинг был заморожен потолком цены),
 наблюдатель прогоняет tools/cap_replay.py --brief по записи и шлёт итог REPLAY CAP BREAKOUT в Telegram.
+Раз в --report-days дней (14) — сводный REPLAY по всем замороженным листингам (cap_replay.py --report) в Telegram.
+REPLAY идёт с nice 19, чтобы не отнимать процессор у проб и записей идущих листингов.
 
 Состояние — logs/watcher_state.json, вывод процессов — logs/<probe|rec>_<SYMBOL>_console.txt.
 Запуск: .venv/bin/python tools/listing_watcher.py   (обычно как systemd-служба mexc-listing-watcher)
@@ -103,14 +105,27 @@ class Watcher:
             recs = sorted(LOGS.glob(f"rec_{sym}_2*.jsonl.gz"))
             if not recs or not find_cap(sym):
                 continue  # листинг не был заморожен
-            r = subprocess.run([sys.executable, str(HERE / "cap_replay.py"), str(recs[-1]), "--brief"],
-                               cwd=ROOT, capture_output=True, text=True, timeout=600)
+            cmd = ["nice", "-n", "19", sys.executable, str(HERE / "cap_replay.py"), str(recs[-1]), "--brief"]
+            r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=600)
             text = r.stdout.strip()
             if r.returncode != 0 or not text:
                 log(f"{sym}: REPLAY CAP BREAKOUT не удался: {r.stderr.strip()[-300:]}")
                 continue
             log(f"{sym}: REPLAY CAP BREAKOUT — {' | '.join(text.splitlines()[1:])}")
             notify(text)
+
+    def check_report(self) -> None:
+        """Раз в --report-days дней — сводный REPLAY CAP BREAKOUT по всем замороженным листингам; процесс сам шлёт его."""
+        last = self.state.setdefault("cap_report_ms", now_ms())  # первая сводка — через срок после включения
+        if now_ms() - last < self.args.report_days * 86_400_000:
+            return
+        self.state["cap_report_ms"] = now_ms()
+        out = (LOGS / "cap_report_console.txt").open("a", encoding="utf-8")
+        cmd = ["nice", "-n", "19", sys.executable, "-u", str(HERE / "cap_replay.py"), "--all-frozen", "--report",
+               "--send", "--json", str(LOGS / f"cap_report_{datetime.now():%Y%m%d}.json")]
+        proc = subprocess.Popen(cmd, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                start_new_session=True)
+        log(f"сводный REPLAY CAP BREAKOUT запущен (pid {proc.pid})")
 
     def has_trades(self, symbol: str) -> bool:
         r = self.client.call("GET", "/api/v3/trades", {"symbol": symbol, "limit": 1})
@@ -150,6 +165,7 @@ class Watcher:
                 break
             self.launch(sym, symbols[sym])
         self.check_replays()
+        self.check_report()
         self.save_state()
 
     def run(self) -> None:
@@ -177,6 +193,8 @@ def main() -> None:
     p.add_argument("--market-test", action="store_true",
                    help="в каждой пробе: MARKET BUY/SELL на 5 USDT (проверка рыночных ордеров через API)")
     p.add_argument("--cap-test", action="store_true", help="в каждой пробе: проверки потолка цены на открытии")
+    p.add_argument("--report-days", type=float, default=14,
+                   help="сводный REPLAY CAP BREAKOUT в Telegram раз в N дней (14)")
     args = p.parse_args()
     LOGS.mkdir(exist_ok=True)
     load_dotenv(ROOT / ".env")
