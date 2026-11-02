@@ -10,9 +10,15 @@
                EARLY — эксперимент клиента 02.11 (только REPLAY): окно FAST с ослабленными фильтрами EARLY_FILTERS,
                LIMIT BUY до bestAsk +5 %, позиция — то, что исполнилось (частично тоже), при неисполнении — повтор;
                цена BUY любого режима — не выше последней сделки × (1 + bidMultiplierUp) (PERCENT_PRICE_BY_SIDE);
+               EARLY идёт с планом 2 / 5 / 10 USDT и с конкуренцией за asks: base — наш BUY получает их первым,
+               «конкуренция 200 мс / 1 с» — объём, ушедший с уровня за это время после прихода BUY, достался другим,
+               «доля 50 %» — нам половина каждого уровня; позиция — только исполненное;
                --early-sweep — тот же вход с изменением одного фактора (спред, глубина, проскальзывание, размер, задержка);
   позиция      профили CAP_DYNAMIC (свой для FAST и CONFIRMED, EARLY — как FAST), CAP_NO_TIME_STOPS (тот же без
                TIME_STOP_*) и LEGACY_STOPS (старые стопы, TP +2/+4 %, удержание 15 с); TP — LIMIT в очереди своего уровня;
+               у EARLY ещё EARLY_EXITS (клиент 02.11): окно 5 / 10 с без ценовых стопов (ликвидность — только
+               диагностика), затем A — продать всё, или B — trailing по пику exitVWAP (MFE +10 %, откат 15 / 20 %,
+               удержание до 30 с) вместе с аварийными стопами и HARD_STOP профиля FAST;
   выход        отмена TP, затем LIMIT SELL по bestBid −0,5 %, до 3 перестановок через 400 мс, затем продажа по bids
                до −20 % (предел PERCENT_PRICE_BY_SIDE; веб-fallback не моделируется), непроданное — остаток.
 Локальный стакан: REST-снимок (lastUpdateId) + поток aggre.depth с проверкой fromVersion/toVersion;
@@ -51,9 +57,11 @@ TP_FEE = 0.0  # maker
 MIN_NOTIONAL = 1.0  # минимальная сумма ордера, USDT (30002)
 # потолки листингов до проверки 30010 в пробе — цена заморозки по записи
 KNOWN_CAPS = {"CHOMPUSDT": 5.0, "MTOUSDT": 0.2}
-# None — фильтр выключен; min_fill — сколько % плана должно найтись в asks до лимита (и не меньше 1 USDT)
+# None — фильтр выключен; min_fill — сколько % плана должно найтись в asks до лимита (и не меньше 1 USDT);
+# конкуренция за asks: compete_ms — объём уровня, ушедший за N мс после прихода нашего BUY, считается доставшимся
+# другим (берём минимум уровня за это время); share — какая доля оставшегося достаётся нам
 FILTERS = dict(max_spread=1.2, bid07=15, bid15=30, ask07=8, max_exit_slip=1.5, max_tick=0.3, max_stress_loss=3.0,
-               buy_aggressive=1.0, min_fill=100)
+               buy_aggressive=1.0, min_fill=100, compete_ms=0, share=1.0)
 EARLY_FILTERS = dict(FILTERS, max_spread=10.0, bid07=5, bid15=10, ask07=0, max_exit_slip=3.0, max_stress_loss=None,
                      buy_aggressive=5.0, min_fill=50)
 # --early-sweep: один фактор за раз от EARLY_FILTERS; usdt и latency — размер входа и задержка ордера
@@ -68,6 +76,10 @@ EARLY_SWEEP = {
     "20 мс": dict(latency=20), "100 мс": dict(latency=100), "200 мс": dict(latency=200),
     "всё без огр., +20 %": dict(max_spread=None, bid07=0, bid15=0, max_exit_slip=None, min_fill=0, buy_aggressive=20.0),
 }
+# EARLY всегда идёт и с конкуренцией за asks (клиент 02.11): base — верхняя оценка, наш BUY получает всё первым
+EARLY_COMPETE = {"конкуренция 200 мс": dict(compete_ms=200), "конкуренция 1 с": dict(compete_ms=1000),
+                 "доля 50 %": dict(share=0.5)}
+EARLY_USDT = (2.0, 5.0, 10.0)  # плановый вход EARLY (клиент 02.11)
 ENTRY = {"FAST": dict(window_ms=10_000, stable_ms=0, min_updates=1),
          "CONFIRMED": dict(window_ms=30_000, stable_ms=200, min_updates=3),
          "EARLY": dict(window_ms=10_000, stable_ms=0, min_updates=1)}
@@ -98,6 +110,10 @@ class Profile:
     stress: float  # резерв проскальзывания для trailing и защиты, %
     max_hold_ms: int
     time_stops: bool = True  # TIME_STOP_NEGATIVE / NO_EDGE / NO_MOMENTUM
+    grace_ms: int = 0  # защитное окно EARLY: столько мс после покупки ценовые стопы не действуют
+    time_exit: bool = False  # EARLY A: по концу окна продать всё
+    peak_act: float | None = None  # EARLY B: trailing по пику exitVWAP включается при MFE (с резервом) ≥ N %
+    peak_pp: float | None = None  # EARLY B: выход при откате exitVWAP на N % от пика
 
 
 CAP_DYNAMIC = {
@@ -109,6 +125,20 @@ CAP_DYNAMIC = {
 CAP_NO_TIME = {m: replace(p, name="CAP_NO_TIME_STOPS", time_stops=False) for m, p in CAP_DYNAMIC.items()}
 LEGACY = Profile("LEGACY_STOPS", -8, -6, None, -2.5, 1.5, 0.15, (3000, -0.3), (5000, 0.3), True, 8_000, None, None,
                  None, ((2, 0.5), (4, 0.5)), None, None, 0.0, 15_000)
+
+
+def early_exit(window_s: int, pullback: int | None) -> Profile:
+    """Выход EARLY (клиент 02.11): окно без ценовых стопов, затем A — продать всё (pullback None) или B — trailing по
+    пику exitVWAP (активация MFE +10 %, откат pullback %, удержание до 30 с); после окна в B действуют аварийные стопы
+    и HARD_STOP профиля FAST, TP и временных стопов нет."""
+    name = f"EARLY_TIME_{window_s}S" if pullback is None else f"EARLY_TRAIL_{window_s}S_{pullback}"
+    return replace(CAP_DYNAMIC["FAST"], name=name, tp=(), trail_act=None, trail_pp=None, trail_after_tp1=None,
+                   guard_target=None, time_stops=False, grace_ms=window_s * 1000, time_exit=pullback is None,
+                   peak_act=None if pullback is None else 10.0, peak_pp=pullback,
+                   max_hold_ms=window_s * 1000 if pullback is None else 30_000)
+
+
+EARLY_EXITS = [early_exit(w, pb) for w in (5, 10) for pb in (None, 15, 20)]
 
 
 # --- данные ---------------------------------------------------------------------
@@ -324,8 +354,11 @@ class Sim:
     seen_updates: int = -1  # book.updates при прошлой проверке: без новой версии стакана проверка не повторяется
     skip_reasons: dict = field(default_factory=dict)
     scan_px: deque = field(default_factory=deque)  # (t, exitVWAP плановой покупки) до входа
-    buy_misses: int = 0  # EARLY: ордер пришёл, а asks до лимита уже нет — повтор
+    buy_misses: int = 0  # EARLY: ордер пришёл, а asks до лимита уже нет (или их забрали другие) — повтор
     buy_at: int = 0
+    fill_at: int = 0  # конкуренция: когда станет ясно, что из asks при приходе досталось нам
+    avail: dict = field(default_factory=dict)  # цена → объём asks до лимита, ещё не забранный другими
+    grace_liq_s: float | None = None  # EARLY: когда в защитном окне впервые пропала ликвидность (только диагностика)
     buy_limit: float = 0.0
     buy_qty: float = 0.0
     decision_ask: float = 0.0
@@ -448,12 +481,26 @@ class Sim:
             return False, "pre_buy_drop", None
         return True, "", (limit, qty, ba, drop)
 
+    def arrive_buy(self, t: int, book: Book) -> None:
+        """BUY дошёл до биржи: asks до лимита в этот момент — наши, если их не заберут другие за compete_ms."""
+        self.avail = {p: q for p, q in book.sorted_asks() if p <= self.buy_limit}
+        if self.flt["compete_ms"] <= 0:
+            self.fill_buy(t, book)
+            return
+        self.fill_at, self.state = t + self.flt["compete_ms"], "BUY_PENDING"
+
+    def compete(self, book: Book) -> None:
+        """Объём уровня, ушедший после прихода нашего BUY, считаем доставшимся другим участникам."""
+        for p in self.avail:
+            self.avail[p] = min(self.avail[p], book.asks.get(p, 0.0))
+
     def fill_buy(self, t: int, book: Book) -> None:
-        got_raw, cost_raw = vwap(book.sorted_asks(), self.buy_qty, self.buy_limit, True)
+        levels = [(p, q * self.flt["share"]) for p, q in sorted(self.avail.items()) if q > 0]
+        got_raw, cost_raw = vwap(levels, self.buy_qty, self.buy_limit, True)
         got = floor_step(got_raw, self.qty_step)
         if got <= 0:
-            if self.mode == "EARLY":  # asks до лимита разобрали за время задержки — снова ищем вход в окне
-                self.buy_misses += 1
+            self.buy_misses += 1
+            if self.mode == "EARLY":  # asks до лимита разобрали — снова ищем вход в окне
                 self.state, self.stable_since, self.stable_updates = "SCAN", None, 0
                 return
             self.finish(t, "BUY_NOT_FILLED")
@@ -537,7 +584,11 @@ class Sim:
         sold, rev = vwap(bids, self.Q, None, False)
         ev = rev / self.Q if sold >= self.Q * 0.999 and self.Q > 0 else None
         elapsed = t - self.entry_ms
+        in_grace = elapsed < p.grace_ms
         if ev is None:
+            if in_grace:  # в защитном окне — только диагностика исчезнувшей ликвидности
+                self.grace_liq_s = elapsed / 1000 if self.grace_liq_s is None else self.grace_liq_s
+                return
             self.start_exit(t, "DEPTH_DISAPPEARED", "exitVWAP не считается", 0.0)
             return
         self.evs.append((t, ev))
@@ -560,8 +611,11 @@ class Sim:
         ev_1s, ev_2s = self.ago(self.evs, t, 1000), self.ago(self.evs, t, 2000)
         if not self.tp1_done and p.trail_act is not None and self.mfe_trail >= p.trail_act:
             self.trail_armed = True
-        if self.tp1_done:
+        if self.tp1_done or p.grace_ms:
             self.peak_ev = max(self.peak_ev, ev)
+        if p.grace_ms:
+            self.check_exit_early(t, ev, plain, stressed, depth_hit, in_grace, last_trade, trade_1s, ev_1s)
+            return
         spread = 100 * (ba - bb) / ((ba + bb) / 2) if ba > bb > 0 else 0.0
         checks = [
             ("DEPTH_DISAPPEARED", depth_hit),
@@ -585,6 +639,33 @@ class Sim:
             if hit:
                 self.start_exit(t, name, f"netPnL {plain:+.2f}% (с резервом {stressed:+.2f}%), MFE {self.mfe_trail:+.2f}%",
                                 ev)
+                return
+
+    def check_exit_early(self, t, ev, plain, stressed, depth_hit, in_grace, last_trade, trade_1s, ev_1s) -> None:
+        """Профили EARLY: в окне ценовых стопов нет; затем A — продать всё, B — аварийные стопы, HARD_STOP,
+        trailing по пику exitVWAP после MFE (с резервом) ≥ peak_act, maxHold."""
+        p = self.profile
+        if in_grace:
+            if depth_hit and self.grace_liq_s is None:
+                self.grace_liq_s = (t - self.entry_ms) / 1000
+            return
+        detail = f"netPnL {plain:+.2f}% (с резервом {stressed:+.2f}%), MFE {self.mfe_trail:+.2f}%"
+        if p.time_exit:
+            self.start_exit(t, f"TIME_EXIT_{p.grace_ms // 1000}S", detail, ev)
+            return
+        if self.mfe_trail >= p.peak_act:
+            self.trail_armed = True
+        checks = [
+            ("DEPTH_DISAPPEARED", depth_hit),
+            ("HARD_STOP", plain <= p.hard),
+            ("FAST_WINDOW_DUMP", last_trade and trade_1s and 100 * (last_trade / trade_1s - 1) <= p.window_dump),
+            ("BID_VWAP_DROP", ev_1s and 100 * (ev / ev_1s - 1) <= p.bid_vwap_drop),
+            ("TRAILING_PEAK", self.trail_armed and ev <= self.peak_ev * (1 - p.peak_pp / 100)),
+            ("MAX_HOLD", t - self.entry_ms >= p.max_hold_ms),
+        ]
+        for name, hit in checks:
+            if hit:
+                self.start_exit(t, name, detail, ev)
                 return
 
     # --- выход ---
@@ -637,7 +718,7 @@ class Sim:
                            mfe=self.mfe, mae=self.mae, tp1=self.tp1_done, tp_fills=self.tp_fills,
                            exit_rounds=self.exit_round, critical=self.critical_used, exit_gap_pct=gap,
                            left_qty=self.Q, left_usdt=self.Q * self.last_bid, fees_usdt=self.fees,
-                           min_depth07_x=self.min_d07, min_depth15_x=self.min_d15)
+                           min_depth07_x=self.min_d07, min_depth15_x=self.min_d15, grace_liq_s=self.grace_liq_s)
         self.state = "DONE"
 
     def mark(self, t: int, book: Book) -> None:
@@ -656,14 +737,18 @@ class Sim:
     def before_event(self, t: int, book: Book) -> None:
         """Отложенные действия, срок которых наступил до события t: стакан ещё в состоянии на момент их прихода."""
         if self.state == "BUY_SENT" and self.buy_at <= t:
-            self.fill_buy(self.buy_at, book)
+            self.arrive_buy(self.buy_at, book)
+        if self.state == "BUY_PENDING" and self.fill_at <= t:
+            self.fill_buy(self.buy_at, book)  # позиция — с момента прихода ордера
         while self.state == "EXITING" and self.exit_next <= t:
             self.exit_step(self.exit_next, book)
 
     def after_event(self, t: int, kind: str, book: Book, deal=None) -> None:
         if kind == "deal":
             self.on_deal(t, *deal)
-        if self.state == "SCAN" and kind != "deal":
+        if self.state == "BUY_PENDING" and kind != "deal":
+            self.compete(book)
+        elif self.state == "SCAN" and kind != "deal":
             self.check_entry(t, book)
         elif self.state == "POSITION":
             self.check_exit(t, book)
@@ -673,23 +758,25 @@ class Sim:
 
 def profiles_for(mode: str) -> list[Profile]:
     m = PROFILE_MODE[mode]
-    return [CAP_DYNAMIC[m], CAP_NO_TIME[m], LEGACY]
+    return [CAP_DYNAMIC[m], CAP_NO_TIME[m], LEGACY] + (EARLY_EXITS if mode == "EARLY" else [])
 
 
 def make_sims(args, opts: Opts, release: int, step: float, qty_step: float, band_up: float) -> list[Sim]:
-    """Ветки: режим × вариант EARLY × профиль × задержка × сумма входа. Варианты --early-sweep — только CAP_DYNAMIC."""
+    """Ветки: режим × вариант EARLY × профиль × задержка × сумма входа. EARLY base и варианты конкуренции —
+    все профили и суммы EARLY_USDT; варианты --early-sweep — только CAP_DYNAMIC и --usdt."""
     sims = []
     for mode in args.modes:
         variants = [("", FILTERS, {})]
         if mode == "EARLY":
             base = dict(EARLY_FILTERS, **args.early)
+            extra = list(EARLY_COMPETE.items()) + (list(EARLY_SWEEP.items()) if args.early_sweep else [])
             variants = [("base", base, {})] + [
-                (label, dict(base, **{k: v for k, v in over.items() if k in base}), over)
-                for label, over in (EARLY_SWEEP.items() if args.early_sweep else ())]
+                (label, dict(base, **{k: v for k, v in over.items() if k in base}), over) for label, over in extra]
         for label, flt, over in variants:
-            profiles = profiles_for(mode) if label in ("", "base") else [CAP_DYNAMIC[PROFILE_MODE[mode]]]
+            full = label in ("", "base") or label in EARLY_COMPETE
+            profiles = profiles_for(mode) if full else [CAP_DYNAMIC[PROFILE_MODE[mode]]]
             latencies = [over["latency"]] if "latency" in over else args.latency
-            sizes = [over["usdt"]] if "usdt" in over else args.usdt
+            sizes = [over["usdt"]] if "usdt" in over else args.early_usdt if mode == "EARLY" and full else args.usdt
             sims += [Sim(mode, label, flt, usdt, prof, lat, opts, release, step, qty_step, band_up)
                      for prof in profiles for lat in latencies for usdt in sizes]
     return sims
@@ -790,12 +877,63 @@ def run_listing(path: Path, args, caps: dict) -> tuple[list[dict], dict]:
     return rows, meta
 
 
-PROFILE_LABEL = {"CAP_DYNAMIC": "CAP_DYNAMIC", "CAP_NO_TIME_STOPS": "без врем. стопов", "LEGACY_STOPS": "LEGACY"}
+PROFILE_LABEL = {"CAP_DYNAMIC": "CAP_DYNAMIC", "CAP_NO_TIME_STOPS": "без врем. стопов", "LEGACY_STOPS": "LEGACY",
+                 **{p.name: (f"время {p.grace_ms // 1000} с" if p.time_exit else
+                             f"окно {p.grace_ms // 1000} с + trailing {p.peak_pp} %") for p in EARLY_EXITS}}
+EARLY_REF = "EARLY_TIME_10S"  # профиль EARLY для строк по листингам и по размеру
 
 
-def base_rows(rows: list[dict], latency: int, usdt: float) -> list[dict]:
-    """Ветки без вариантов --early-sweep, с заданными задержкой и суммой входа."""
-    return [r for r in rows if r["variant"] in ("", "base") and r["latency"] == latency and r["usdt"] == usdt]
+def base_rows(rows: list[dict], latency: int, usdt: float, variant: str = "base") -> list[dict]:
+    """Ветки FAST/CONFIRMED и EARLY варианта variant с заданными задержкой и суммой входа."""
+    return [r for r in rows if r["variant"] in ("", variant) and r["latency"] == latency and r["usdt"] == usdt]
+
+
+def mean(xs: list[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def hold_mean(rs: list[dict], sec: int) -> float:
+    """Средний netPnL % «если держать sec секунд» — по входам, где стакан тогда выдерживал продажу."""
+    return mean([v for r in rs if (v := r["hold_marks"].get(sec)) is not None])
+
+
+def hold_usdt(rs: list[dict], sec: int) -> float:
+    """Условный PnL удержания в USDT: вся купленная позиция продана по bids через sec секунд после входа."""
+    return sum(r["buy_usdt"] * v / 100 for r in rs if (v := r["hold_marks"].get(sec)) is not None)
+
+
+def prof_line(rs: list[dict], label: str) -> str:
+    """Итог профиля: реализованный PnL отдельно от непроданного остатка."""
+    total = sum(r["pnl_usdt"] for r in rs)
+    wins = sum(r["pnl_usdt"] > 0 for r in rs)
+    return (f"  {label}: {total:+.2f} USDT ({wins}/{len(rs) - wins}), худший {min(r['pnl_pct'] for r in rs):+.1f} %, "
+            f"остаток {sum(r['left_usdt'] for r in rs):.2f}; MFE/MAE {mean([r['mfe'] for r in rs]):+.1f}/"
+            f"{mean([r['mae'] for r in rs]):+.1f} %, удержание {mean([r['hold_s'] for r in rs]):.0f} с")
+
+
+def bought_line(main: list[dict]) -> str:
+    """Купленный объём и причины, по которым входа или исполнения не было (по ветке CAP_DYNAMIC каждого листинга)."""
+    entered = [r for r in main if "entry_ms" in r]
+    misses = sum(r.get("buy_misses") or 0 for r in main)
+    skips = Counter(no_entry_reason(r) for r in main if "entry_ms" not in r)
+    line = f"входов {len(entered)} из {len(main)}"
+    if entered:
+        line += (f", куплено {sum(r['buy_usdt'] for r in entered):.1f} USDT "
+                 f"(ср. {mean([r['fill_pct'] for r in entered]):.0f} % плана)")
+    if misses:
+        line += f"; BUY без исполнения {misses} раз"
+    if skips:
+        line += "; нет входа: " + ", ".join(f"{k} {v}" for k, v in skips.most_common())
+    return line
+
+
+def early_compact(rs: list[dict]) -> str:
+    """Итоги профилей EARLY_EXITS одной строкой: реализованный PnL, USDT."""
+    parts = []
+    for p in EARLY_EXITS:
+        prs = [r for r in rs if r["profile"] == p.name and "pnl_usdt" in r]
+        parts.append(f"{PROFILE_LABEL[p.name]} {sum(r['pnl_usdt'] for r in prs):+.2f}")
+    return "; ".join(parts)
 
 
 def brief(meta: dict, rows: list[dict], latency: int, usdt: float) -> str:
@@ -804,8 +942,8 @@ def brief(meta: dict, rows: list[dict], latency: int, usdt: float) -> str:
     if meta["status"] == "no_cap":
         return f"{head}\nПотолка нет (30010 не было) — листинг не замороженный"
     if meta["status"] == "not_released":
-        return (f"{head}\nПотолок {meta['cap']} ({meta['src']}), но сделок выше него в записи не было "
-                "(не снят или цена ушла ниже) — входа нет")
+        return (f"{head}\nПотолок {meta['cap']} ({meta['src']}), подтверждённого снятия нет: сделок выше потолка "
+                "в записи не было — торгового входа нет")
     lines = [head, f"Потолок {meta['cap']} ({meta['src']}), снят на T+{(meta['release_ms'] - meta['open_ms']) / 1000:.0f} с"]
     base = base_rows(rows, latency, usdt)
     for mode in ENTRY:
@@ -813,93 +951,121 @@ def brief(meta: dict, rows: list[dict], latency: int, usdt: float) -> str:
         if not rs:
             continue
         r0 = rs[0]
-        label = mode + (" (эксперимент)" if mode == "EARLY" else "")
+        label = mode + (f" (эксперимент, план {usdt:g} USDT, наш BUY первым)" if mode == "EARLY" else "")
         if "entry_ms" not in r0:
-            lines.append(f"{label}: нет входа ({no_entry_reason(r0)})")
-            continue
-        fill = f", исполнено {r0['fill_pct']:.0f} %" if r0["fill_pct"] < 99.9 else ""
-        lines.append(f"{label}: вход через {(r0['entry_ms'] - meta['release_ms']) / 1000:.1f} с "
-                     f"по {r0['entry_px'] / meta['cap']:.2f}× потолка{fill}")
-        for r in rs:
-            left = f", остаток {r['left_usdt']:.2f} USDT" if r["left_usdt"] >= 0.01 else ""
-            lines.append(f"  {PROFILE_LABEL[r['profile']]}: {r['pnl_pct']:+.2f} % "
-                         f"({r['reason']}, {r['hold_s']:.0f} с{left})")
-        lines.append("  если держать: " + ", ".join(f"{sec} с {v:+.1f} %" for sec, v in r0["hold_marks"].items()
-                                                    if v is not None))
+            misses = f", BUY без исполнения {r0['buy_misses']} раз" if r0.get("buy_misses") else ""
+            lines.append(f"{label}: нет входа ({no_entry_reason(r0)}{misses})")
+        else:
+            lines.append(f"{label}: вход через {(r0['entry_ms'] - meta['release_ms']) / 1000:.1f} с "
+                         f"по {r0['entry_px'] / meta['cap']:.2f}× потолка, куплено {r0['buy_usdt']:.2f} USDT")
+            for r in rs:
+                if r["profile"] in PROFILE_LABEL and (mode != "EARLY" or r["profile"] == "CAP_DYNAMIC"):
+                    left = f", остаток {r['left_usdt']:.2f} USDT" if r["left_usdt"] >= 0.01 else ""
+                    lines.append(f"  {PROFILE_LABEL[r['profile']]}: {r['pnl_pct']:+.2f} % "
+                                 f"({r['reason']}, {r['hold_s']:.0f} с{left})")
+            if mode == "EARLY":
+                lines.append("  выходы EARLY, USDT: " + early_compact(rs))
+            lines.append("  если держать: " + ", ".join(f"{sec} с {v:+.1f} %" for sec, v in r0["hold_marks"].items()
+                                                        if v is not None))
+        if mode == "EARLY":
+            for variant in EARLY_COMPETE:
+                cr = [r for r in base_rows(rows, latency, usdt, variant) if r["mode"] == mode
+                      and r["profile"] == EARLY_REF]
+                if cr:
+                    c0 = cr[0]
+                    got = (f"куплено {c0['buy_usdt']:.2f} USDT, время 10 с {c0['pnl_usdt']:+.2f} USDT"
+                           if "entry_ms" in c0 else f"нет входа ({no_entry_reason(c0)})")
+                    lines.append(f"  {variant}: {got}")
     lines.append(f"{usdt:g} USDT на вход, задержка {latency} мс; модель упрощённая — см. doc/cap_breakout_resheniya.md")
     return "\n".join(lines)
 
 
-def mean(xs: list[float]) -> float:
-    return sum(xs) / len(xs) if xs else 0.0
-
-
 def report(rows: list[dict], metas: list[dict], latency: int, usdt: float, fee: float, days: int) -> list[str]:
-    """Сводка REPLAY по всем замороженным листингам — два сообщения Telegram: итог по режимам и по листингам."""
+    """Сводка REPLAY по всем замороженным листингам — три сообщения Telegram: FAST и CONFIRMED, EARLY, по листингам."""
     short = lambda s: s.removesuffix("USDT")  # noqa: E731
     since = datetime.now().timestamp() - days * 86_400
     new = [m["symbol"] for m in metas
            if datetime.strptime("_".join(m["rec"].split("_")[2:4])[:15], "%Y%m%d_%H%M%S").timestamp() >= since]
     released = [m for m in metas if m["status"] == "released"]
+    unreleased = [short(m["symbol"]) for m in metas if m["status"] != "released"]
     head = [f"📊 CAP BREAKOUT — сводный REPLAY на {datetime.now():%d.%m.%Y}",
-            f"Замороженных листингов: {len(metas)}, с пробоем потолка: {len(released)}; "
-            f"новые за {days} дн.: {', '.join(map(short, new)) or 'нет'}",
-            f"{usdt:g} USDT на вход, задержка {latency} мс, taker {100 * fee:g} % в USDT. "
-            "Остаток — непроданное по bid, в PnL не входит. EARLY — эксперимент, только REPLAY."]
+            f"Замороженных листингов: {len(metas)} — со снятием и пробоем потолка {len(released)}"
+            + (f", без подтверждённого снятия и без входа {len(unreleased)} ({', '.join(unreleased)})"
+               if unreleased else "") + f"; новые за {days} дн.: {', '.join(map(short, new)) or 'нет'}",
+            f"{usdt:g} USDT на вход, задержка {latency} мс, taker {100 * fee:g} % в USDT. Итог — реализованный PnL; "
+            "остаток — непроданное по bid, в итог не входит; «если держать» — условный PnL удержания."]
     base = base_rows(rows, latency, usdt)
-    for mode in ENTRY:
+    for mode in ("FAST", "CONFIRMED"):
         rs_mode = [r for r in base if r["mode"] == mode]
         if not rs_mode:
             continue
         main = [r for r in rs_mode if r["profile"] == "CAP_DYNAMIC"]
         entered = [r for r in main if "entry_ms" in r]
-        head.append(f"\n{mode}: входов {len(entered)} из {len(main)}")
+        head.append(f"\n{mode}: {bought_line(main)}")
         for prof, label in PROFILE_LABEL.items():
             rs = [r for r in rs_mode if r["profile"] == prof and "pnl_usdt" in r]
-            if not rs:
-                continue
-            total = sum(r["pnl_usdt"] for r in rs)
-            wins = sum(r["pnl_usdt"] > 0 for r in rs)
-            head.append(f"  {label}: {total:+.2f} USDT ({wins}/{len(rs) - wins}), худший "
-                        f"{min(r['pnl_pct'] for r in rs):+.1f} %, остаток {sum(r['left_usdt'] for r in rs):.2f}; "
-                        f"MFE/MAE {mean([r['mfe'] for r in rs]):+.1f}/{mean([r['mae'] for r in rs]):+.1f} %, "
-                        f"удержание {mean([r['hold_s'] for r in rs]):.0f} с")
+            if rs:
+                head.append(prof_line(rs, label))
         if entered:
             gaps = [r["exit_gap_pct"] for r in rs_mode if r.get("exit_gap_pct") is not None]
-            fills = [r["fill_pct"] for r in entered]
             head.append(f"  проскальзывание: вход {mean([r['slippage_pct'] for r in entered]):+.2f} % к ask решения"
-                        + (f", выход {mean(gaps):+.2f} % к exitVWAP сигнала" if gaps else "")
-                        + (f"; исполнено ср. {mean(fills):.0f} % плана" if min(fills) < 99.9 else ""))
-            head.append("  если держать всю позицию: " + ", ".join(f"{sec} с {hold_mean(entered, sec):+.1f} %"
-                                                                    for sec in HOLD_MARKS_S))
-        skips = Counter(no_entry_reason(r) for r in main if "entry_ms" not in r)
-        if skips:
-            head.append("  нет входа: " + ", ".join(f"{k} {v}" for k, v in skips.most_common()))
-    per = ["По листингам — CAP_DYNAMIC, % позиции (— нет входа):"]
+                        + (f", выход {mean(gaps):+.2f} % к exitVWAP сигнала" if gaps else ""))
+            head.append("  если держать всю позицию: " + ", ".join(
+                f"{sec} с {hold_usdt(entered, sec):+.2f} USDT ({hold_mean(entered, sec):+.1f} %)" for sec in (10, 60)))
+    early = [f"EARLY — эксперимент, только REPLAY; план {usdt:g} USDT, задержка {latency} мс"]
+    rs_mode = [r for r in base if r["mode"] == "EARLY"]
+    if rs_mode:
+        main = [r for r in rs_mode if r["profile"] == "CAP_DYNAMIC"]
+        entered = [r for r in main if "entry_ms" in r]
+        early.append(f"Наш BUY получает asks первым (верхняя оценка): {bought_line(main)}")
+        for prof, label in PROFILE_LABEL.items():
+            rs = [r for r in rs_mode if r["profile"] == prof and "pnl_usdt" in r]
+            if rs:
+                early.append(prof_line(rs, label))
+        if entered:
+            early.append("  если держать всю позицию: " + ", ".join(
+                f"{sec} с {hold_usdt(entered, sec):+.2f} USDT" for sec in (10, 60)))
+        for variant in EARLY_COMPETE:
+            vr = [r for r in base_rows(rows, latency, usdt, variant) if r["mode"] == "EARLY"]
+            vmain = [r for r in vr if r["profile"] == "CAP_DYNAMIC"]
+            if vmain:
+                early.append(f"\n{variant}: {bought_line(vmain)}")
+                early.append("  выходы, USDT: " + early_compact(vr))
+        sizes = sorted({r["usdt"] for r in rows if r["mode"] == "EARLY" and r["variant"] == "base"})
+        parts = []
+        for size in sizes:
+            sr = [r for r in base_rows(rows, latency, size) if r["mode"] == "EARLY" and r["profile"] == EARLY_REF]
+            got = [r for r in sr if "entry_ms" in r]
+            parts.append(f"{size:g} USDT — входов {len(got)}, куплено {sum(r['buy_usdt'] for r in got):.1f}, "
+                         f"итог {sum(r['pnl_usdt'] for r in got):+.2f}")
+        early.append(f"\nПо размеру плана ({PROFILE_LABEL[EARLY_REF]}, наш BUY первым): " + "; ".join(parts))
+    per = [f"По листингам — % позиции: FAST и CONFIRMED с CAP_DYNAMIC, EARLY с выходом «{PROFILE_LABEL[EARLY_REF]}» "
+           "(наш BUY первым); — нет входа:"]
     for m in metas[-20:]:
         if m["status"] != "released":
-            per.append(f"  {short(m['symbol'])}: сделок выше потолка не было — входа нет")
+            per.append(f"  {short(m['symbol'])}: без подтверждённого снятия потолка — торгового входа нет")
             continue
         parts = []
         for mode in ENTRY:
-            r = next((r for r in base if r["symbol"] == m["symbol"] and r["mode"] == mode
-                      and r["profile"] == "CAP_DYNAMIC"), None)
+            prof = EARLY_REF if mode == "EARLY" else "CAP_DYNAMIC"
+            r = next((r for r in base if r["symbol"] == m["symbol"] and r["mode"] == mode and r["profile"] == prof),
+                     None)
             if r is not None:
                 parts.append(f"{mode} {r['pnl_pct']:+.1f}" if "pnl_pct" in r else f"{mode} — ({no_entry_reason(r)})")
         per.append(f"  {short(m['symbol'])}: " + ", ".join(parts))
-    return ["\n".join(head), "\n".join(per)]
+    return ["\n".join(head), "\n".join(early), "\n".join(per)]
 
 
 def summary(rows: list[dict]) -> None:
     print("\nИтого (листинги без входа в сумму не входят; остаток — непроданное по bid, в сумму не входит):")
-    print(f"  {'режим':<9} {'вариант':<19} {'профиль':<17} {'мс':>3} {'USDT':>4}  входов  +/−   сумма USDT  средний %"
-          f"  худший %  MFE ср. %  MAE ср. %  удерж. с  к ask %  исполн. %  остаток USDT  "
+    print(f"  {'режим':<9} {'вариант':<19} {'профиль':<19} {'мс':>3} {'USDT':>4}  входов  +/−   сумма USDT  средний %"
+          f"  худший %  MFE ср. %  MAE ср. %  удерж. с  к ask %  куплено USDT  исполн. %  остаток USDT  "
           + "  ".join(f"держать {sec} с" for sec in HOLD_MARKS_S))
     order = {m: i for i, m in enumerate(ENTRY)}
     keys = sorted({(r["mode"], r["variant"], r["profile"], r["latency"], r["usdt"]) for r in rows},
                   key=lambda k: (order[k[0]], k[1] != "base", k[1], k[2], k[3], k[4]))
     for k in keys:
-        tag = f"  {k[0]:<9} {k[1]:<19} {k[2]:<17} {k[3]:>3} {k[4]:>4g}"
+        tag = f"  {k[0]:<9} {k[1]:<19} {k[2]:<19} {k[3]:>3} {k[4]:>4g}"
         rs = [r for r in rows if (r["mode"], r["variant"], r["profile"], r["latency"], r["usdt"]) == k
               and "pnl_usdt" in r]
         if not rs:
@@ -907,18 +1073,13 @@ def summary(rows: list[dict]) -> None:
             continue
         total = sum(r["pnl_usdt"] for r in rs)
         wins, losses = sum(r["pnl_usdt"] > 0 for r in rs), sum(r["pnl_usdt"] <= 0 for r in rs)
-        avg = 100 * total / sum(r["buy_usdt"] for r in rs)
-        print(f"{tag}  {len(rs):>6}  {wins}/{losses}  {total:>+10.3f}  {avg:>+9.2f}"
+        bought = sum(r["buy_usdt"] for r in rs)
+        print(f"{tag}  {len(rs):>6}  {wins}/{losses}  {total:>+10.3f}  {100 * total / bought:>+9.2f}"
               f"  {min(r['pnl_pct'] for r in rs):>+8.2f}  {mean([r['mfe'] for r in rs]):>+9.2f}"
               f"  {mean([r['mae'] for r in rs]):>+9.2f}  {mean([r['hold_s'] for r in rs]):>8.1f}"
-              f"  {mean([r['slippage_pct'] for r in rs]):>+7.2f}  {mean([r['fill_pct'] for r in rs]):>9.0f}"
+              f"  {mean([r['slippage_pct'] for r in rs]):>+7.2f}  {bought:>12.2f}  {mean([r['fill_pct'] for r in rs]):>9.0f}"
               f"  {sum(r['left_usdt'] for r in rs):>12.3f}  "
               + "  ".join(f"{hold_mean(rs, sec):>+{10 + len(str(sec))}.2f}" for sec in HOLD_MARKS_S))
-
-
-def hold_mean(rs: list[dict], sec: int) -> float:
-    """Средний netPnL % «если держать sec секунд» — по входам, где стакан тогда выдерживал продажу."""
-    return mean([v for r in rs if (v := r["hold_marks"].get(sec)) is not None])
 
 
 def parse_early(text: str) -> dict:
@@ -939,6 +1100,8 @@ def main() -> None:
     p.add_argument("--cap", action="append", default=[], help="потолок без 30010 в логе: SYMBOL=цена (можно несколько)")
     p.add_argument("--latency", default="50", help="задержка ордера в мс, через запятую (50)")
     p.add_argument("--usdt", default=f"{ORDER_USDT:g}", help=f"сумма входа в USDT, через запятую ({ORDER_USDT:g})")
+    p.add_argument("--early-usdt", default=",".join(f"{x:g}" for x in EARLY_USDT),
+                   help=f"плановый вход EARLY в USDT, через запятую ({','.join(f'{x:g}' for x in EARLY_USDT)})")
     p.add_argument("--modes", default="FAST,CONFIRMED,EARLY")
     p.add_argument("--early", type=parse_early, default={},
                    help="изменить фильтры EARLY: max_spread=20,min_fill=0,... (off — выключить фильтр)")
@@ -965,6 +1128,7 @@ def main() -> None:
     args = p.parse_args()
     args.latency = [int(x) for x in args.latency.split(",")]
     args.usdt = [float(x) for x in args.usdt.split(",")]
+    args.early_usdt = [float(x) for x in args.early_usdt.split(",")]
     args.modes = args.modes.split(",")
     caps = {}
     for c in args.cap:
