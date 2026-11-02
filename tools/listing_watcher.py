@@ -6,6 +6,7 @@
 если не задан — TG_CHAT_ID). Для каждой отслеживаемой пары запускает отдельными процессами:
   tools/probe_listing.py SYMBOL --open auto ...   — проверки API и пробный ордер
   tools/listing_recorder.py SYMBOL ...            — запись всех WS-потоков и REST-снимков
+  tools/paper_cap.py SYMBOL ...                   — PAPER CAP BREAKOUT на живом потоке (без ордеров)
 Процессы запускаются в своей сессии и переживают перезапуск наблюдателя.
 Если для пары процесс уже работает (например, запущенный вручную), второй не запускается.
 Когда проба и запись пары закончились, а в логе пробы есть 30010 (листинг был заморожен потолком цены),
@@ -89,6 +90,8 @@ class Watcher:
         self.spawn("probe", "probe_listing.py", symbol, probe_args)
         self.spawn("rec", "listing_recorder.py", symbol,
                    ["--duration", str(a.duration), "--max-wait", str(a.max_wait)])
+        if a.paper:
+            self.spawn("paper", "paper_cap.py", symbol, ["--max-wait", str(a.max_wait)])
         self.state["handled"][symbol] = {"ts": now_ms(), "status": info.get("status"),
                                          "firstOpenTime": info.get("firstOpenTime"), "zones": info.get("conceptPlates"),
                                          "replay": "pending"}
@@ -160,7 +163,7 @@ class Watcher:
         for sym in self.tracker.tracked:
             if sym in self.state["handled"] or sym not in symbols:
                 continue
-            if self.active_count() >= self.args.max_active * 2:
+            if self.active_count() >= self.args.max_active * 3:
                 log(f"{sym}: лимит одновременных процессов, отложено")
                 break
             self.launch(sym, symbols[sym])
@@ -193,6 +196,8 @@ def main() -> None:
     p.add_argument("--market-test", action="store_true",
                    help="в каждой пробе: MARKET BUY/SELL на 5 USDT (проверка рыночных ордеров через API)")
     p.add_argument("--cap-test", action="store_true", help="в каждой пробе: проверки потолка цены на открытии")
+    p.add_argument("--no-paper", dest="paper", action="store_false",
+                   help="не запускать PAPER CAP BREAKOUT (tools/paper_cap.py) для каждой пары")
     p.add_argument("--report-days", type=float, default=14,
                    help="сводный REPLAY CAP BREAKOUT в Telegram раз в N дней (14)")
     args = p.parse_args()
