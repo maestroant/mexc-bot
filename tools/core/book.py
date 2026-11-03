@@ -14,6 +14,56 @@ class Book:
         self.updates = 0  # число применённых изменений (для «различных обновлений» CONFIRMED)
         self.gaps = 0
         self._sorted: dict[str, tuple[int, list]] = {}  # сторона → (updates, уровни по цене) — общий для всех веток
+        # активность и свежесть (ТЗ v2.1, 2.9–2.10): времена обновлений и изменений лучших уровней
+        self.upd_ts: deque = deque()
+        self.best_ts: deque = deque()
+        self.last_t = 0
+        self._last_best: tuple | None = None
+        self.px: deque = deque()  # (t, bestBid, bestAsk) после каждого обновления — для изменений за 100–500 мс
+        self.first_trade: float | None = None  # цена первой сделки листинга (её ставит движок)
+        self.first_ask: float | None = None  # первый действительный bestAsk после открытия (firstValidAsk ТЗ v2.1)
+        self._ago_cache: dict = {}
+        self._depth_cache: dict = {}
+
+    def stamp(self, t: int, before: int) -> None:
+        """Отметить время, если событие изменило стакан (before — updates до события)."""
+        if self.updates == before or not self.valid:
+            return
+        self.last_t = t
+        self.upd_ts.append(t)
+        bids, asks = self.levels("bids"), self.levels("asks")
+        best = (bids[0] if bids else None, asks[0] if asks else None)
+        if bids and asks:
+            self.px.append((t, bids[0][0], asks[0][0]))
+        if best != self._last_best:
+            self.best_ts.append(t)
+            self._last_best = best
+
+    def px_ago(self, t: int, ms: int, keep_ms: int = 2000):
+        """(t, bestBid, bestAsk) не позже t − ms (последнее такое) или None; старше keep_ms — отбрасываются.
+        Результат кешируется на момент t: его спрашивают все ветки на одном и том же событии."""
+        key = (t, ms)
+        if key in self._ago_cache:
+            return self._ago_cache[key]
+        if self._ago_cache and next(iter(self._ago_cache))[0] != t:
+            self._ago_cache.clear()
+        while len(self.px) > 1 and self.px[1][0] <= t - keep_ms:
+            self.px.popleft()
+        val = None
+        for row in self.px:
+            if row[0] <= t - ms:
+                val = row
+            else:
+                break
+        self._ago_cache[key] = val
+        return val
+
+    def activity(self, t: int, ms: int = 1000) -> tuple[int, int]:
+        """updatesPerSec и bestUpdatesPerSec за последние ms."""
+        for q in (self.upd_ts, self.best_ts):
+            while q and q[0] <= t - ms:
+                q.popleft()
+        return len(self.upd_ts), len(self.best_ts)
 
     def snapshot(self, d: dict) -> None:
         if self.valid and int(d["lastUpdateId"]) <= self.version:
@@ -57,6 +107,24 @@ class Book:
             cached = self.updates, sorted(book.items(), reverse=side == "bids")
             self._sorted[side] = cached
         return cached[1]
+
+    def depth(self, side: str, coef: float) -> float:
+        """Глубина в USDT от лучшей цены стороны на долю coef вглубь (bids — вниз от bestBid, asks — вверх от bestAsk);
+        кешируется до следующего изменения стакана."""
+        key = (self.updates, side, coef)
+        cached = self._depth_cache.get(key)
+        if cached is None:
+            if len(self._depth_cache) > 64:
+                self._depth_cache.clear()
+            lv = self.levels(side)
+            if not lv:
+                cached = 0.0
+            elif side == "bids":
+                cached = depth_usdt(lv, lv[0][0] * (1 - coef), lv[0][0])
+            else:
+                cached = depth_usdt(lv, lv[0][0], lv[0][0] * (1 + coef))
+            self._depth_cache[key] = cached
+        return cached
 
     def best(self) -> tuple[float, float]:
         bids, asks = self.levels("bids"), self.levels("asks")

@@ -26,8 +26,8 @@
 
 Исполнение: количество округляется вниз до шага пары, ордер меньше 1 USDT не ставится (остаток — пыль);
 TP исполняется сделкой выше его цены целиком, сделкой по его цене — после очереди, стоявшей на уровне при постановке;
-комиссии — taker 0,08 % в USDT (tradeFee листинговых пар, commissionAsset в myTrades), TP — maker 0 %;
---fee-in-coin — прежняя модель с BUY-комиссией в купленной монете. Наш ордер не меняет стакан.
+комиссии — taker и maker инструмента из exchangeInfo записи (takerCommission/makerCommission; на листинговых парах
+0,08 % и 0, списываются в USDT); --fee — своя ставка taker, --fee-in-coin — прежняя модель с BUY-комиссией в монете. Наш ордер не меняет стакан.
 
 Запуск на сервере (записи лежат там):
   python3 tools/cap_replay.py logs/rec_LALAUSDT_*.jsonl.gz --latency 20,50,100,200
@@ -121,7 +121,8 @@ def run_listing(path: Path, args, caps: dict) -> tuple[list[dict], dict]:
         return [], meta
     step, qty_step, _, zones = market_params(info)
     opts = Opts(args.stops_basis == "stressed", args.depth_band / 100, args.depth_persist_ms, args.entry_stress,
-                args.entry_basis, args.pre_buy_drop, args.fee / 100, args.fee_in_coin)
+                args.entry_basis, args.pre_buy_drop, (args.fee or 100 * TAKER_FEE) / 100, args.fee_in_coin,
+                fee_from_info=args.fee is None)
     engine = CapEngine(args, opts, cap, open_ms, info, cand_ms)
     for t, kind, data in events:
         engine.on_event(t, kind, data)
@@ -390,7 +391,8 @@ def main() -> None:
                    help="изменить фильтры EARLY: max_spread=20,min_fill=0,... (off — выключить фильтр)")
     p.add_argument("--early-sweep", action="store_true",
                    help="EARLY с изменением одного фактора за раз (EARLY_SWEEP), только профиль CAP_DYNAMIC")
-    p.add_argument("--fee", type=float, default=100 * TAKER_FEE, help=f"комиссия taker, %% ({100 * TAKER_FEE:g})")
+    p.add_argument("--fee", type=float, help="комиссия taker, %% (по умолчанию — takerCommission/makerCommission "
+                                                 "инструмента из exchangeInfo записи)")
     p.add_argument("--fee-in-coin", action="store_true", help="BUY-комиссия в купленной монете (прежняя модель)")
     p.add_argument("--stops-basis", choices=("plain", "stressed"), default="plain",
                    help="стопы CAP_DYNAMIC по netPnL без резерва проскальзывания (plain) или с ним (stressed)")
@@ -430,7 +432,8 @@ def main() -> None:
         if args.brief:
             texts.append(brief(meta, listing_rows, args.latency[0], args.usdt[0]))
     if args.report:
-        texts += report(rows, metas, args.latency[0], args.usdt[0], args.fee / 100, args.report_days)
+        texts += report(rows, metas, args.latency[0], args.usdt[0], (args.fee or 100 * TAKER_FEE) / 100,
+                        args.report_days)
     if texts:
         print("\n\n".join(texts))
     else:
