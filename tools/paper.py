@@ -1,7 +1,8 @@
 """PAPER на живом потоке, без ордеров: те же движки ядра, что у REPLAY, — основная стратегия (core.cap_breakout.MainEngine:
 контрольный BASELINE по ТЗ v2.1 и малая часть сетки MAIN_EARLY) и CAP BREAKOUT (CapEngine: FAST, CONFIRMED, EARLY).
 
-Основная стратегия стартует от первой сделки пары (T0) и ведётся до T0 + --main-duration с. Потолок CAP BREAKOUT берётся
+Основная стратегия стартует с T0 по единой модели ядра (официальное время открытия firstOpenTime; нет — первый действительный
+стакан или первая сделка) и ведётся до T0 + --main-duration с. Потолок CAP BREAKOUT берётся
 из 30010 в логе пробы (probe_listing --cap-test), проверка раз в 2 с до T+--cap-wait мин; нашёлся — CapEngine ведёт стакан
 и после снятия потолка — ветки до снятия + --after-release с. Потолка в первые секунды PAPER ещё не знает, поэтому
 основная стратегия на замороженном листинге идёт без ограничения потолком (вход там отсекает спред 7–24 %).
@@ -53,7 +54,7 @@ class Paper:
         self.open_ms: int | None = None
         self.cap: tuple[float, str] | None = None
         self.cap_checked = False  # потолка нет и ждать его больше не нужно
-        # основная стратегия ведёт стакан с запуска, T0 — первая сделка; cap — CAP BREAKOUT, когда известен потолок
+        # основная стратегия ведёт стакан с запуска, T0 — по модели MainEngine; cap — CAP BREAKOUT, когда известен потолок
         self.engines: dict[str, CapEngine] = {"main": MainEngine(self.main_cfg, Opts(), None, {})}
         self.states: dict[str, list[str]] = {}
         self.done: dict[str, bool] = {}
@@ -84,16 +85,17 @@ class Paper:
         events = events_of(entry)
         if not events:
             return
-        if self.open_ms is None and any(kind == "deal" for _, kind, _ in events):
-            self.open_ms = next(t for t, kind, _ in events if kind == "deal")
-            self.write("OPEN", open_ms=self.open_ms)
-            self.log("открытие (первая сделка): основная стратегия идёт, жду потолок из лога пробы")
         started = time.perf_counter()
         for name, eng in self.engines.items():
             if not self.done.get(name):
                 for t, kind, ev in events:
                     eng.on_event(t, kind, ev)
         self.proc_ms.append(1000 * (time.perf_counter() - started))
+        main = self.engines["main"]  # T0 — по единой модели ядра: официальное время, иначе стакан или первая сделка
+        if self.open_ms is None and main.open_ms is not None and events[-1][0] >= main.open_ms:
+            self.open_ms = main.open_ms
+            self.write("OPEN", open_ms=self.open_ms, exchange_open_ms=main.exchange_open_ms())
+            self.log("открытие: основная стратегия идёт, жду потолок из лога пробы")
         for name in self.engines:
             self.track(name)
 
@@ -183,7 +185,8 @@ class Paper:
                    proc_max_ms=max(self.proc_ms, default=0.0),
                    delay_over_best_p50_ms=pct(self.delay_ms, 0.5) - base,
                    delay_over_best_p99_ms=pct(self.delay_ms, 0.99) - base)
-        self.write("SUMMARY", result=result, cap=self.cap, open_ms=self.open_ms, lag=lag, rows=rows)
+        self.write("SUMMARY", result=result, cap=self.cap, open_ms=self.open_ms, lag=lag, rows=rows,
+                   times=self.engines["main"].times())
         self.log(f"готово: {result}; задержки {lag}")
         if self.open_ms is not None:
             notify(self.text(rows, lag))
@@ -192,6 +195,11 @@ class Paper:
         """Итог PAPER для Telegram: BASELINE, MAIN_EARLY, CAP BREAKOUT — раздельно."""
         zones = market_params(self.info)[3] if self.info else ""
         lines = [f"🧪 PAPER — {self.sym}" + (f" [{zones}]" if zones else "")]
+        tm = self.engines["main"].times()
+        exec10 = (tm["first_exec"].get(f"{ORDER_USDT:g}") or {}).get("rel_ms")
+        lines.append(f"от T0 ({'официальное время' if tm['exchange_open_ms'] else 'нет официального времени'}): "
+                     f"стакан +{tm['first_book_rel_ms']} мс, первая сделка +{tm['first_trade_rel_ms']} мс, "
+                     f"BUY {ORDER_USDT:g} USDT исполним с +{exec10} мс")
         main = [r for r in rows.get("main", []) if r["latency"] == LATENCY_MS]
         r0 = next((r for r in main if r["mode"] == "MAIN" and r["variant"] == "base" and r["profile"] == "MAIN_V21"
                    and r["usdt"] == ORDER_USDT), None)

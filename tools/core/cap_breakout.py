@@ -24,22 +24,29 @@ KNOWN_CAPS = {"CHOMPUSDT": 5.0, "MTOUSDT": 0.2}
 # основной стратегии (MAIN) — ещё активность и свежесть стакана, окно входа и ожидание исполнения BUY
 FILTERS = dict(max_spread=1.2, bid07=15, bid15=30, ask07=8, max_exit_slip=1.5, max_tick=0.3, max_stress_loss=3.0,
                buy_aggressive=1.0, min_fill=100, compete_ms=0, share=1.0, min_ups=None, min_best_ups=None,
-               max_book_age=None, window_ms=None, buy_rest_ms=0, max_chase=None, chase_ref="trade", mom_ms=0)
+               max_book_age=None, window_ms=None, buy_rest_ms=0, max_chase=None, chase_ref="ask", mom_ms=0,
+               mom_strict=False)
 # ТЗ v2.1 (основная стратегия): фильтры исходного ТЗ без entryStressLoss CAP BREAKOUT; окно 8 с от открытия,
 # прогрев 500 мс, LIMIT BUY ждёт исполнения до 1200 мс (buyFillTimeoutMs), частичное — остаток отменяется
 MAIN_FILTERS = dict(FILTERS, max_stress_loss=None, min_ups=6, min_best_ups=3, max_book_age=500, buy_rest_ms=1200)
 MAIN_VARIANTS = {"окно 30 с": dict(window_ms=30_000), "конкуренция 1 с": dict(compete_ms=1000)}
-# MAIN_EARLY (клиент 03.11, только REPLAY): ранний вход на листингах без потолка — сетка комбинаций признаков.
-# Окно W с от открытия; рост bestAsk ≤ C % от первой сделки (C40) или от первого действительного ask (C40a — первая
-# сделка бывает случайным принтом: EMYA 0,03 при рынке 0,055); импульс за M мс (середина выросла, bestBid не упал;
-# 0 — без проверки); depthBid0.7 ≥ D × план и depthBid1.5 ≥ 2D × план; план S USDT; выход MAIN_V21 или MAIN_TP_TRAIL.
-# Постоянные условия: спред ≤ 3 %, стакан не старше 500 мс, весь план в asks до bestAsk +1 %, проскальзывание
-# выхода ≤ 1,5 %; активность (нужна секунда истории) не проверяется. Только данные до момента решения.
+# MAIN_EARLY (клиент 03–04.11, только REPLAY и PAPER): ранний вход на листингах без потолка — сетка комбинаций.
+# Окно W с от T0 (официальное время открытия); рост bestAsk ≤ C % от первого действительного ask двустороннего стакана
+# (основная опора) или от первой сделки (метка «t», диагностика: первая сделка бывает случайным принтом — EMYA 0,03 при
+# рынке 0,055); импульс за M мс: середина выросла и bestBid не упал (метка «s» — строгий: bestBid вырос хотя бы на шаг
+# цены, т. е. рост середины не только от расширения спреда); M0 — без проверки; истории на окно нет — импульс не
+# подтверждён; depthBid0.7 ≥ D × план и depthBid1.5 ≥ 2D × план; стакан не старше A мс; план S USDT; выход MAIN_V21,
+# MAIN_TP_TRAIL или MAIN_TP_TRAIL_NT. Постоянные условия: спред ≤ 3 %, весь план в asks до bestAsk +1 %, проскальзывание
+# выхода ≤ 1,5 %, стакан синхронизирован; активность в первые секунды не проверяется. Только данные до момента решения.
 MAIN_EARLY_FILTERS = dict(MAIN_FILTERS, max_spread=3.0, ask07=0, min_ups=None, min_best_ups=None)
-MAIN_EARLY_GRID = dict(window_s=(1, 2, 3, 5), chase=(20, 40, 60), chase_ref=("trade", "ask"), mom_ms=(0, 100, 250, 500),
-                       depth_x=(2, 5, 15), usdt=(2.0, 5.0, 10.0))
-MAIN_EARLY_PAPER = dict(window_s=(2, 5), chase=(40,), chase_ref=("ask",), mom_ms=(0, 250), depth_x=(5,),
+MAIN_EARLY_GRID = dict(window_s=(1, 2, 3, 5), chase=(20, 40, 60), chase_ref=("ask", "trade"),
+                       momentum=((0, False), (100, False), (100, True), (250, False), (250, True), (500, False),
+                                 (500, True)),
+                       depth_x=(2, 5, 15), book_age=(100, 250, 500), usdt=(2.0, 5.0, 10.0))
+MAIN_EARLY_PAPER = dict(window_s=(2, 5), chase=(40,), chase_ref=("ask",),
+                        momentum=((0, False), (250, False), (250, True)), depth_x=(5,), book_age=(250,),
                         usdt=(10.0,))  # для PAPER — малая часть сетки
+SPLIT_MARGIN = 0.10  # запас к minNotional при делении позиции на TP: цена может уйти, комиссия, округление по qtyStep
 
 # --sweep main_replay: один фактор за раз от MAIN_FILTERS, только профиль MAIN_V21
 MAIN_SWEEP = {
@@ -101,6 +108,7 @@ class Profile:
     stress: float  # резерв проскальзывания для trailing и защиты, %
     max_hold_ms: int
     time_stops: bool = True  # TIME_STOP_NEGATIVE / NO_EDGE / NO_MOMENTUM
+    time_stops_after_tp1: bool = True  # False — после фактического исполнения TP1 временные стопы остатка выключены
     grace_ms: int = 0  # защитное окно EARLY: столько мс после покупки ценовые стопы не действуют
     time_exit: bool = False  # EARLY A: по концу окна продать всё
     peak_act: float | None = None  # EARLY B: trailing по пику exitVWAP включается при MFE (с резервом) ≥ N %
@@ -138,6 +146,9 @@ MAIN_NO_TIME = replace(MAIN_V21, name="MAIN_NO_TIME_STOPS", time_stops=False)
 # остатка и защита общего netPnL +0,3 %, удержание до 30 с; стопы до TP1 — как у MAIN_V21
 MAIN_TP_TRAIL = replace(MAIN_V21, name="MAIN_TP_TRAIL", tp=((2, 0.5),), trail_after_tp1=5.0, guard_target=0.3,
                         max_hold_ms=30_000)
+# то же, но после исполнения TP1 TIME_STOP_* для остатка выключены (клиент 04.11); HARD_STOP, FAST_WINDOW_DUMP,
+# FAST_DROP_STOP, DEPTH_DISAPPEARED, trailing, защита общего netPnL и maxHold действуют
+MAIN_TP_TRAIL_NT = replace(MAIN_TP_TRAIL, name="MAIN_TP_TRAIL_NT", time_stops_after_tp1=False)
 
 
 def find_cap(symbol: str) -> tuple[float, str] | None:
@@ -302,11 +313,12 @@ class Sim:
                 return False, "no_first_price", None
             if ba > ref * (1 + f["max_chase"] / 100):
                 return False, "chase", None
-        if f["mom_ms"]:  # импульс: середина выросла, bestBid не упал за mom_ms
+        if f["mom_ms"]:  # импульс: середина выросла, bestBid не упал (строгий: вырос на шаг цены) за mom_ms
             past = book.px_ago(t, f["mom_ms"])
             if past is None:
                 return False, "momentum_not_ready", None
-            if not (bb + ba > past[1] + past[2] and bb >= past[1]):
+            bid_ok = bb >= past[1] + self.step * 0.999 if f["mom_strict"] else bb >= past[1]
+            if not (bb + ba > past[1] + past[2] and bid_ok):
                 return False, "no_momentum", None
         if f["max_spread"] is not None and 100 * (ba - bb) / mid > f["max_spread"]:
             return False, "spread", None
@@ -395,20 +407,35 @@ class Sim:
         self.C, self.Q = (cost, got * (1 - fee)) if self.opts.fee_in_coin else (cost * (1 + fee), got)
         self.q0 = self.Q
         self.fees += cost * fee
-        placed, n = 0.0, len(self.profile.tp)
-        for i, (pct, share) in enumerate(self.profile.tp):
-            price = ceil_step(avg * (1 + pct / 100), self.step)
-            rest = n > 1 and i == n - 1  # последний из нескольких TP — на весь остаток
-            qty = floor_step(self.Q - placed if rest else self.Q * share, self.qty_step)
-            if qty * price < MIN_NOTIONAL:
-                continue
+        for price, qty in self.tp_plan(avg):
             queue = sum(q for p, q in book.asks.items() if abs(p - price) < self.step * 0.01)
             self.tps.append(TP(price, qty, qty, queue))
-            placed += qty
         self.state = "POSITION"
         self.result.update(entry_ms=t, entry_px=avg, buy_usdt=cost, decision_ask=self.decision_ask,
                            slippage_pct=100 * (avg / self.decision_ask - 1), fill_pct=100 * got / self.buy_qty,
                            buy_misses=self.buy_misses)
+
+    def tp_plan(self, avg: float) -> list[tuple[float, float]]:
+        """TP профиля по фактической позиции. Если при делении хоть одна часть — TP или остаток под trailing — не
+        проходит minNotional с запасом SPLIT_MARGIN (цена, комиссия, qtyStep), ставится один TP первого уровня
+        на весь объём (клиент 04.11, решение D2 по ТЗ)."""
+        tps, n = self.profile.tp, len(self.profile.tp)
+        if not tps:
+            return []
+        parts, placed = [], 0.0
+        for i, (pct, share) in enumerate(tps):
+            price = ceil_step(avg * (1 + pct / 100), self.step)
+            rest = n > 1 and i == n - 1  # последний из нескольких TP — на весь остаток
+            qty = floor_step(self.Q - placed if rest else self.Q * share, self.qty_step)
+            parts.append((price, qty))
+            placed += qty
+        need = MIN_NOTIONAL * (1 + SPLIT_MARGIN)
+        left = floor_step(self.Q - placed, self.qty_step)  # остаток вне TP (частичный TP + trailing)
+        if all(q * p >= need for p, q in parts) and (left <= 0 or left * avg * (1 - SPLIT_MARGIN) >= need):
+            return parts
+        whole = floor_step(self.Q, self.qty_step)
+        self.result["single_tp"] = True
+        return [(parts[0][0], whole)] if whole * parts[0][0] >= MIN_NOTIONAL else []
 
     # --- позиция ---
     def on_deal(self, t: int, price: float, qty: float, side: int) -> None:
@@ -500,6 +527,7 @@ class Sim:
             self.check_exit_early(t, ev, plain, stressed, depth_hit, in_grace, last_trade, trade_1s, ev_1s)
             return
         spread = 100 * (ba - bb) / ((ba + bb) / 2) if ba > bb > 0 else 0.0
+        time_stops = p.time_stops and (p.time_stops_after_tp1 or not self.tp1_done)
         checks = [
             ("DEPTH_DISAPPEARED", depth_hit),
             ("HARD_STOP", basis <= p.hard),
@@ -511,10 +539,10 @@ class Sim:
             ("TRAILING_AFTER_TP1", p.trail_after_tp1 is not None and self.tp1_done
              and ev <= self.peak_ev * (1 - p.trail_after_tp1 / 100)),
             ("BREAK_EVEN_STOP", self.mfe_stop >= p.be_act and basis <= p.be_floor),
-            ("TIME_STOP_NEGATIVE", p.time_stops and elapsed >= p.time_neg[0] and basis < p.time_neg[1]),
-            ("TIME_STOP_NO_EDGE", p.time_stops and elapsed >= p.no_edge[0]
+            ("TIME_STOP_NEGATIVE", time_stops and elapsed >= p.time_neg[0] and basis < p.time_neg[1]),
+            ("TIME_STOP_NO_EDGE", time_stops and elapsed >= p.no_edge[0]
              and basis < p.no_edge[1] + (spread if p.no_edge_plus_spread else 0)),
-            ("TIME_STOP_NO_MOMENTUM", p.time_stops and elapsed >= p.no_momentum_ms and not self.tp1_done
+            ("TIME_STOP_NO_MOMENTUM", time_stops and elapsed >= p.no_momentum_ms and not self.tp1_done
              and ev_2s and ev <= ev_2s),
             ("MAX_HOLD", elapsed >= p.max_hold_ms),
         ]
@@ -684,13 +712,14 @@ def make_main_sims(cfg, opts: Opts, open_ms: int, step: float, qty_step: float, 
                  for prof in profiles for lat in cfg.latency for usdt in cfg.usdt]
     grid = getattr(cfg, "main_early", None)  # MAIN_EARLY_GRID / MAIN_EARLY_PAPER или None
     if grid and price_cap is None:  # MAIN_EARLY — только листинги без потолка
-        for w, c, ref, m, d in product(grid["window_s"], grid["chase"], grid["chase_ref"], grid["mom_ms"],
-                                       grid["depth_x"]):
-            flt = dict(MAIN_EARLY_FILTERS, window_ms=w * 1000, max_chase=c, chase_ref=ref, mom_ms=m, bid07=d,
-                       bid15=2 * d)
-            label = f"W{w} C{c}{'a' if ref == 'ask' else ''} M{m} D{d}"
+        for w, c, ref, (m, strict), d, age in product(grid["window_s"], grid["chase"], grid["chase_ref"],
+                                                       grid["momentum"], grid["depth_x"], grid["book_age"]):
+            flt = dict(MAIN_EARLY_FILTERS, window_ms=w * 1000, max_chase=c, chase_ref=ref, mom_ms=m, mom_strict=strict,
+                       bid07=d, bid15=2 * d, max_book_age=age)
+            label = f"W{w} C{c}{'t' if ref == 'trade' else ''} M{m}{'s' if strict else ''} D{d} A{age}"
             sims += [Sim("MAIN_EARLY", label, flt, usdt, prof, lat, opts, open_ms, step, qty_step, band_up, price_cap)
-                     for prof in (MAIN_V21, MAIN_TP_TRAIL) for lat in cfg.latency for usdt in grid["usdt"]]
+                     for prof in (MAIN_V21, MAIN_TP_TRAIL, MAIN_TP_TRAIL_NT) for lat in cfg.latency
+                     for usdt in grid["usdt"]]
     return sims
 
 
@@ -791,13 +820,26 @@ class CapEngine:
 
 
 class MainEngine(CapEngine):
-    """Основная стратегия (ТЗ v2.1) по одному листингу: ветки стартуют от открытия (T0 — первая сделка), как только
-    локальный стакан действителен; окно входа и прогрев считаются от T0. price_cap — потолок замороженного листинга.
-    open_ms=None — T0 ещё неизвестно (PAPER до открытия): стакан ведётся, T0 станет первая сделка."""
+    """Основная стратегия (BASELINE и MAIN_EARLY) по одному листингу. Временная модель одна для REPLAY и PAPER:
+    T0 — официальное время открытия (firstOpenTime из exchangeInfo); если его нет — первое из «первый действительный
+    двусторонний стакан» и «первая сделка». Ветки стартуют с T0, как только стакан действителен; окно входа и прогрев
+    считаются от T0. Отдельно сохраняются first_book_ms, first_trade_ms и first_exec — первый момент, когда BUY плана
+    по bestAsk +1 % (не выше полосы биржи) исполним целиком по asks. price_cap — потолок замороженного листинга."""
+
+    EXEC_USDT = (2.0, 5.0, 10.0)
+    PRE_MS = 2000  # часы сервера и биржи расходятся на сотни мс: события за 2 с до T0 ещё относятся к открытию
 
     def __init__(self, cfg, opts: Opts, open_ms: int | None, info: dict, price_cap: float | None = None):
         super().__init__(cfg, opts, 0.0, open_ms, info, open_ms)
         self.price_cap = price_cap
+        self.first_book_ms: int | None = None
+        self.first_trade_ms: int | None = None
+        self.first_exec: dict[float, tuple[int, float]] = {}  # план USDT → (время, bestAsk)
+        self.last_trade_px: float | None = None
+
+    def exchange_open_ms(self) -> int | None:
+        v = (self.info or {}).get("firstOpenTime")
+        return int(v) if v else None
 
     def try_start(self, t: int, kind: str, data) -> None:
         if self.open_ms is not None and t >= self.open_ms and self.book.valid:
@@ -806,14 +848,50 @@ class MainEngine(CapEngine):
             self.sims = make_main_sims(self.cfg, with_fees(self.opts, self.info), self.open_ms, step, qty_step,
                                        band_up, self.price_cap)
 
+    def near_open(self, t: int) -> bool:
+        return self.open_ms is None or t >= self.open_ms - self.PRE_MS
+
     def on_event(self, t: int, kind: str, data) -> None:
         book = self.book
-        if kind == "deal" and self.open_ms is None:
-            self.open_ms = self.cand_ms = t  # PAPER: открытие — первая сделка
-        if kind == "deal" and book.first_trade is None and t >= self.open_ms:
-            book.first_trade = data[0]  # опорные цены для ограничения роста (MAIN_EARLY) и отчёта
+        if self.open_ms is None and self.exchange_open_ms():
+            self.open_ms = self.cand_ms = self.exchange_open_ms()
+        if kind == "deal":
+            self.last_trade_px = data[0]
+            if book.first_trade is None and self.near_open(t):
+                book.first_trade, self.first_trade_ms = data[0], t  # опоры для ограничения роста и отчёта
+                if self.open_ms is None:
+                    self.open_ms = self.cand_ms = t  # официального времени нет — открытие по первой сделке
         super().on_event(t, kind, data)
-        if book.first_ask is None and self.open_ms is not None and t >= self.open_ms and book.valid:
-            bb, ba = book.best()
-            if ba > bb > 0:
-                book.first_ask = ba
+        if not book.valid or not self.near_open(t):
+            return
+        bb, ba = book.best()
+        if not ba > bb > 0:
+            return
+        if book.first_ask is None:
+            book.first_ask, self.first_book_ms = ba, t
+            if self.open_ms is None:
+                self.open_ms = self.cand_ms = t  # или по первому действительному двустороннему стакану
+        if len(self.first_exec) < len(self.EXEC_USDT):
+            self.track_exec(t, ba)
+
+    def track_exec(self, t: int, ba: float) -> None:
+        """Первый момент, когда BUY плана по bestAsk +1 % исполним целиком по asks (без учёта других участников)."""
+        step, qty_step, band_up, _ = market_params(self.info)
+        limit = floor_step(ba * 1.01, step)
+        if self.last_trade_px:
+            limit = min(limit, floor_step(self.last_trade_px * (1 + band_up), step))
+        for usdt in self.EXEC_USDT:
+            if usdt in self.first_exec or limit < ba:
+                continue
+            qty = floor_step(usdt / limit, qty_step)
+            got, _ = vwap(self.book.sorted_asks(), qty, limit, True)
+            if qty > 0 and got >= qty * 0.999:
+                self.first_exec[usdt] = (t, ba)
+
+    def times(self) -> dict:
+        """Отметки времени листинга относительно T0, мс."""
+        rel = lambda v: None if v is None or self.open_ms is None else v - self.open_ms  # noqa: E731
+        return dict(t0_ms=self.open_ms, exchange_open_ms=self.exchange_open_ms(),
+                    first_book_rel_ms=rel(self.first_book_ms), first_ask=self.book.first_ask,
+                    first_trade_rel_ms=rel(self.first_trade_ms), first_trade=self.book.first_trade,
+                    first_exec={f"{u:g}": dict(rel_ms=rel(v[0]), ask=v[1]) for u, v in self.first_exec.items()})

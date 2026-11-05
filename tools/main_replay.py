@@ -36,9 +36,10 @@ from pathlib import Path
 
 from core.cap_breakout import (HOLD_MARKS_S, KNOWN_CAPS, LOGS, MAIN_EARLY_GRID, ORDER_USDT, MainEngine, Opts,
                                find_cap, no_entry_reason)
-from core.feed import events_of, iter_lines, line_t
+from core.feed import events_of, frame_time, iter_lines, line_t, ws_base_lag
 
-PROFILE_LABEL = {"MAIN_V21": "стандартный", "MAIN_NO_TIME_STOPS": "без врем. стопов", "MAIN_TP_TRAIL": "TP1+trailing"}
+PROFILE_LABEL = {"MAIN_V21": "стандартный", "MAIN_NO_TIME_STOPS": "без врем. стопов", "MAIN_TP_TRAIL": "TP1+trailing",
+                 "MAIN_TP_TRAIL_NT": "TP1+trail, без вр.ст."}
 SKIP_SYMBOLS = {"PFPUSDT": "делистинг, не листинг", "PALUSDT": "листинг отменён"}
 GROUPS = {"no_cap": "Без потолка", "cap": "С потолком (замороженные)", "api": "API закрыт в начальном окне"}
 
@@ -56,31 +57,46 @@ def api_closed(symbol: str, within_ms: int = 30_000) -> bool:
 
 
 def load_open(path: Path, before_ms: int = 60_000, after_ms: int = 120_000):
-    """События вокруг открытия: от T0 − before_ms до T0 + after_ms; exchangeInfo — последнее до T0 + 10 с."""
-    open_ms = None
+    """События вокруг открытия. T0 — официальное время открытия (firstOpenTime в exchangeInfo записи), нет его —
+    OPEN_DETECTED записи. Окно — от T0 − before_ms до T0 + after_ms; exchangeInfo — последнее до T0 + 10 с.
+    Время WS-кадров — с поправкой на остановки процесса записи (core.feed.frame_time).
+    Возвращает T0, события, exchangeInfo, сведения о времени."""
+    detected, first_open = None, None
     for line in iter_lines(path):
-        if '"OPEN_DETECTED"' in line:
+        if '"ch":"exchangeInfo"' in line and '"firstOpenTime"' in line:
+            syms = (json.loads(line)["data"] or {}).get("symbols") or []
+            if syms and syms[0].get("firstOpenTime"):
+                first_open = int(syms[0]["firstOpenTime"])
+        elif '"OPEN_DETECTED"' in line:
             e = json.loads(line)
-            open_ms = e["data"].get("open_ms") or e["t"]
+            detected = e["data"].get("open_ms") or e["t"]
             break
-    if open_ms is None:
-        return None, [], {}
-    events, info = [], {}
+    if detected is None:
+        return None, [], {}, {}
+    t0 = first_open or detected
+    lo, hi = min(t0, detected) - before_ms, max(t0, detected) + after_ms
+    entries, info = [], {}
     for line in iter_lines(path):
         t = line_t(line)
-        if t > open_ms + after_ms:
+        if t > hi + 10_000:  # кадры, задержанные остановкой записи, получены позже своего времени
             break
         if '"ch":"exchangeInfo"' in line:
             syms = (json.loads(line)["data"] or {}).get("symbols") or []
-            if syms and t <= open_ms + 10_000:
+            if syms and t <= t0 + 10_000:
                 info = syms[0]
-        elif t < open_ms - before_ms:
+        elif t < lo:
             continue
         elif ('"src":"rest","ch":"depth"' in line or '"publicAggreDepths"' in line
               or '"publicAggreDeals"' in line):
-            events += events_of(json.loads(line))
-    events.sort(key=lambda e: e[0])
-    return open_ms, events, info
+            entries.append(json.loads(line))
+    if first_open and not info.get("firstOpenTime"):
+        info = dict(info, firstOpenTime=first_open)
+    base = ws_base_lag(entries)
+    stalled = [e for e in entries if frame_time(e, base) != e["t"]]
+    events = sorted((ev for e in entries for ev in events_of(e, base) if ev[0] <= hi), key=lambda ev: ev[0])
+    times = dict(exchange_open_ms=first_open, detected_rel_ms=detected - t0, stalled_frames=len(stalled),
+                 stall_max_ms=max((e["t"] - frame_time(e, base) for e in stalled), default=0))
+    return t0, events, info, times
 
 
 def trajectory(events: list, open_ms: int, ref: float | None = None) -> dict:
@@ -91,8 +107,10 @@ def trajectory(events: list, open_ms: int, ref: float | None = None) -> dict:
         return {}
     first = ref or deals[0][1]
     t_max, p_max = max(deals, key=lambda x: x[1])
+    at = lambda ms: next((100 * (p / first - 1) for t, p in reversed(deals) if t <= open_ms + ms), None)  # noqa: E731
     return dict(first=first, max_rise_pct=100 * (p_max / first - 1), max_at_s=(t_max - open_ms) / 1000,
-                at60_pct=100 * (deals[-1][1] / first - 1), min_pct=100 * (min(p for _, p in deals) / first - 1))
+                at1_pct=at(1000), at5_pct=at(5000), at60_pct=100 * (deals[-1][1] / first - 1),
+                min_pct=100 * (min(p for _, p in deals) / first - 1))
 
 
 def run_listing(path: Path, args) -> tuple[list[dict], dict]:
@@ -101,7 +119,8 @@ def run_listing(path: Path, args) -> tuple[list[dict], dict]:
     if symbol in SKIP_SYMBOLS:
         meta["status"] = SKIP_SYMBOLS[symbol]
         return [], meta
-    open_ms, events, info = load_open(path)
+    open_ms, events, info, times = load_open(path)
+    meta["times"] = times
     if open_ms is None or not events:
         meta["status"] = "открытия в записи нет"
         return [], meta
@@ -118,6 +137,7 @@ def run_listing(path: Path, args) -> tuple[list[dict], dict]:
         engine.on_event(t, kind, data)
     engine.finish(events[-1][0])
     meta["traj"] = trajectory(events, open_ms, engine.book.first_ask)
+    meta["times"].update(engine.times())
     rows = engine.rows(symbol)
     for r in rows:
         r["open_ms"] = open_ms
@@ -169,6 +189,29 @@ def print_baseline(rows: list[dict], metas: list[dict], latency: int, usdt: floa
                 print(f"  {short(m['symbol']):<9} нет входа ({why}){cap}; {traj_text(m)}")
             else:
                 print(f"  {short(m['symbol']):<9} {entry_text(r)}{cap}; {traj_text(m)}")
+
+
+def print_moments(metas: list[dict]) -> None:
+    """Три момента листинга (клиент 04.11): стакан, первая сделка, первый исполнимый BUY — от T0 (официальное время)."""
+    print("\nТри момента, мс от T0 (официальное время открытия); рост — к первому действительному ask:")
+    for group in ("no_cap", "cap"):
+        print(f"  {GROUPS[group]}:")
+        for m in metas:
+            tm = m.get("times") or {}
+            if m["group"] != group or "first_book_rel_ms" not in tm:
+                continue
+            ask = tm.get("first_ask")
+            rise = lambda px: f"{100 * (px / ask - 1):+.0f} %" if px and ask else "—"  # noqa: E731
+            ex = tm.get("first_exec") or {}
+            exec_txt = ", ".join(f"{u} USDT +{v['rel_ms']} ({rise(v['ask'])})" for u, v in ex.items()) or "не было"
+            tr = m.get("traj") or {}
+            path_txt = (f"; цена сделок к первому ask: 1 с {tr['at1_pct']:+.0f} %, 5 с {tr['at5_pct']:+.0f} %"
+                        if tr.get("at1_pct") is not None and tr.get("at5_pct") is not None else "")
+            stall = (f"; запись стояла до {tm['stall_max_ms']} мс — время кадров исправлено по sendTime"
+                     if tm.get("stalled_frames") else "")
+            print(f"    {short(m['symbol']):<9} стакан +{tm['first_book_rel_ms']} (ask {ask:.6g}), первая сделка "
+                  f"+{tm.get('first_trade_rel_ms')} ({rise(tm.get('first_trade'))}), BUY исполним целиком: "
+                  f"{exec_txt}{path_txt}{stall}")
 
 
 def stat_line(rs_all: list[dict]) -> str:
@@ -226,16 +269,26 @@ def print_early(rows: list[dict], metas: list[dict], latency: int, top: int) -> 
           f"итог без лучшего листинга > 0 у {robust}; меньше 3 входов у {few} (в рейтинг не идут). "
           f"Лучшие {top} по итогу без лучшего листинга:")
     stats = [s for s in stats if len(s[3]) >= 3]
-    print(f"  {'комбинация':<18} {'выход':<13} {'план':>4}  входов  +/−   итог  без лучш.  худший %  MFE / MAE %  "
-          f"вход с  рост до входа %  спред %  bid0.7 USDT  держать 10 с %")
+    print(f"  {'комбинация':<22} {'выход':<21} {'план':>4}  входов  +/−   итог  без лучш.  остаток  худший %  "
+          f"MFE / MAE %  вход с  рост до входа %  спред %  bid0.7 USDT  держать 10 с %")
     for robust_total, total, (variant, prof, usdt), rs, rs_all in stats[:top]:
         wins = sum(r["pnl_usdt"] > 0 for r in rs)
-        print(f"  {variant:<18} {PROFILE_LABEL[prof]:<13} {usdt:>4g}  {len(rs):>2} из {len(rs_all):<2} {wins}/{len(rs) - wins}"
-              f"  {total:>+5.2f}  {robust_total:>+8.2f}  {min((r['pnl_pct'] for r in rs), default=0):>+8.1f}"
+        print(f"  {variant:<22} {PROFILE_LABEL[prof]:<21} {usdt:>4g}  {len(rs):>2} из {len(rs_all):<2} {wins}/{len(rs) - wins}"
+              f"  {total:>+5.2f}  {robust_total:>+8.2f}  {sum(r['left_usdt'] for r in rs):>7.2f}"
+              f"  {min((r['pnl_pct'] for r in rs), default=0):>+8.1f}"
               f"  {mean([r['mfe'] for r in rs]):>+5.1f} / {mean([r['mae'] for r in rs]):>+5.1f}"
               f"  {mean([(r['entry_ms'] - r['open_ms']) / 1000 for r in rs]):>6.1f}"
-              f"  {mean([r.get('rise_from_first_pct') for r in rs]):>+15.0f}  {mean([r['decision_spread_pct'] for r in rs]):>7.2f}"
+              f"  {mean([r.get('rise_from_first_ask_pct') for r in rs]):>+15.0f}"
+              f"  {mean([r['decision_spread_pct'] for r in rs]):>7.2f}"
               f"  {mean([r['decision_bid07_usdt'] for r in rs]):>11.0f}  {mean([r['hold_marks'].get(10) for r in rs]):>+14.1f}")
+    exits = defaultdict(lambda: [0.0, 0, 0.0])
+    for r in early:
+        if "pnl_usdt" in r and r["usdt"] == ORDER_USDT:
+            e = exits[r["profile"]]
+            e[0], e[1], e[2] = e[0] + r["pnl_usdt"], e[1] + 1, e[2] + r["left_usdt"]
+    print(f"\nВыходы на одних и тех же входах (все комбинации, план {ORDER_USDT:g} USDT): "
+          + "; ".join(f"{PROFILE_LABEL[k]} — входов {v[1]}, итог {v[0]:+.2f} USDT, остаток {v[2]:.2f}"
+                      for k, v in sorted(exits.items())))
     for robust_total, total, (variant, prof, usdt), rs, rs_all in stats[:1]:
         print(f"\nЛучшая комбинация {variant}, выход {PROFILE_LABEL[prof]}, {usdt:g} USDT — по листингам:")
         for r in sorted(rs_all, key=lambda r: r["symbol"]):
@@ -286,6 +339,7 @@ def main() -> None:
         print("Не листинги или без открытия: " + ", ".join(f"{short(m['symbol'])} ({m['status']})" for m in skipped) + "\n")
     print_baseline(rows, metas, args.latency[0], args.usdt[0])
     print_baseline_summary(rows, metas, args.latency[0], args.usdt[0])
+    print_moments(metas)
     print_early(rows, metas, args.latency[0], a.top)
     print(f"\n({len(files)} записей, {time.monotonic() - started:.0f} с)", file=sys.stderr)
     if a.json:
