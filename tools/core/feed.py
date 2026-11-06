@@ -57,3 +57,10 @@ def events_of(entry: dict, base_lag: int | None = None) -> list[tuple]:
         return [(t, "deal", (float(d["price"]), float(d["quantity"]), int(d.get("tradeType") or 0)))
                 for d in data["publicAggreDeals"].get("deals", [])]
     return []
+
+
+def frame_meta(entry: dict) -> tuple[int, int | None]:
+    """(localReceiveTime, exchangeEventTime) кадра: время получения записью и sendTime биржи (у REST-снимка — None)."""
+    data = entry.get("data")
+    send = data.get("sendTime") if isinstance(data, dict) else None
+    return entry["t"], int(send) if send else None

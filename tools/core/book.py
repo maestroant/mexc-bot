@@ -23,6 +23,8 @@ class Book:
         self.first_trade: float | None = None  # цена первой сделки листинга (её ставит движок)
         self.first_ask: float | None = None  # первый действительный bestAsk после открытия (firstValidAsk ТЗ v2.1)
         self._ago_cache: dict = {}
+        self.recv_t: int | None = None  # текущий кадр: время получения (localReceiveTime) и биржи (sendTime)
+        self.exch_t: int | None = None
         self._depth_cache: dict = {}
 
     def stamp(self, t: int, before: int) -> None:

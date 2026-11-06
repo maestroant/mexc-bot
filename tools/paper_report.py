@@ -10,7 +10,10 @@ import json
 import time
 from collections import Counter
 
-from core.cap_breakout import LOGS, no_entry_reason
+from collections import defaultdict
+
+from core.cap_breakout import LOGS, PREREG_ID, no_entry_reason
+from main_replay import PROFILE_LABEL, evaluate
 
 GROUPS = [
     ("BASELINE (ТЗ v2.1)", lambda r: r["mode"] == "MAIN" and r["variant"] == "base" and r["profile"] == "MAIN_V21"),
@@ -44,6 +47,28 @@ def engines(summary: dict) -> dict:
     return {"cap": rows} if isinstance(rows, list) else rows
 
 
+def print_prereg(items: list[dict]) -> None:
+    """MAIN_EARLY по предрегистрированным вариантам (doc/preregistratsiya.md): только листинги, прошедшие PAPER
+    с текущим PREREG_ID; оценка — итог, без лучшего листинга, худшая сделка, исполненный объём, качество данных."""
+    reg = [s for s in items if s.get("prereg") == PREREG_ID]
+    print(f"\nMAIN_EARLY, предрегистрация {PREREG_ID}: листингов {len(reg)}")
+    if not reg:
+        return
+    gaps = [s["symbol"][:-4] for s in reg if (s.get("times") or {}).get("book_gaps_rel_ms")]
+    if gaps:
+        print("  качество: разрывы версий стакана — " + ", ".join(gaps))
+    combos = defaultdict(list)
+    for s in reg:
+        for r in engines(s).get("main") or []:
+            if r["mode"] == "MAIN_EARLY":
+                combos[(r["variant"], r["profile"], r["usdt"])].append(r)
+    for (variant, prof, usdt), rs in sorted(combos.items()):
+        e = evaluate([r for r in rs if "pnl_usdt" in r])
+        print(f"  {variant:<20} {PROFILE_LABEL.get(prof, prof):<22} {usdt:>4g}  входов {e['n']} из {len(rs)}, "
+              f"итог {e['total']:+.2f}, без лучшего {e['wo_best']:+.2f}, худшая {e['worst_usdt']:+.2f} USDT, "
+              f"куплено {e['volume']:.1f}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--days", type=float, default=14, help="логи PAPER за N дней (14)")
@@ -66,6 +91,7 @@ def main() -> None:
         for r in got[:30]:
             print(f"  {r['symbol'][:-4]:<9} {r['variant']:<16} {r['profile']:<18} {r['usdt']:>4g}  {r['pnl_pct']:+6.2f} % "
                   f"({r['reason']}, {r['hold_s']:.0f} с)")
+    print_prereg(items)
 
 
 if __name__ == "__main__":

@@ -43,9 +43,12 @@ MAIN_EARLY_GRID = dict(window_s=(1, 2, 3, 5), chase=(20, 40, 60), chase_ref=("as
                        momentum=((0, False), (100, False), (100, True), (250, False), (250, True), (500, False),
                                  (500, True)),
                        depth_x=(2, 5, 15), book_age=(100, 250, 500), usdt=(2.0, 5.0, 10.0))
+# предрегистрация (клиент 05.11): варианты, которые сравниваются на новых листингах, зафиксированы до их появления
+# (doc/preregistratsiya.md); менять — только новым PREREG_ID и только для листингов после изменения
+PREREG_ID = "PR-2026-11-06"
 MAIN_EARLY_PAPER = dict(window_s=(2, 5), chase=(40,), chase_ref=("ask",),
-                        momentum=((0, False), (250, False), (250, True)), depth_x=(5,), book_age=(250,),
-                        usdt=(10.0,))  # для PAPER — малая часть сетки
+                        momentum=((0, False), (250, False), (250, True)), depth_x=(5,), book_age=(100, 250, 500),
+                        usdt=(2.0, 10.0))  # 18 комбинаций × 5 выходов × 2 плана
 SPLIT_MARGIN = 0.10  # запас к minNotional при делении позиции на TP: цена может уйти, комиссия, округление по qtyStep
 
 # --sweep main_replay: один фактор за раз от MAIN_FILTERS, только профиль MAIN_V21
@@ -113,6 +116,8 @@ class Profile:
     time_exit: bool = False  # EARLY A: по концу окна продать всё
     peak_act: float | None = None  # EARLY B: trailing по пику exitVWAP включается при MFE (с резервом) ≥ N %
     peak_pp: float | None = None  # EARLY B: выход при откате exitVWAP на N % от пика
+    guard_arm: bool = False  # защита общего netPnL включается, только когда расчётный netPnL (с резервом) достиг цели
+    trail_all_at: float | None = None  # trailing всей позиции без TP: включается, когда exitVWAP ≥ цены входа + N %
 
 
 CAP_DYNAMIC = {
@@ -149,6 +154,15 @@ MAIN_TP_TRAIL = replace(MAIN_V21, name="MAIN_TP_TRAIL", tp=((2, 0.5),), trail_af
 # то же, но после исполнения TP1 TIME_STOP_* для остатка выключены (клиент 04.11); HARD_STOP, FAST_WINDOW_DUMP,
 # FAST_DROP_STOP, DEPTH_DISAPPEARED, trailing, защита общего netPnL и maxHold действуют
 MAIN_TP_TRAIL_NT = replace(MAIN_TP_TRAIL, name="MAIN_TP_TRAIL_NT", time_stops_after_tp1=False)
+# клиент 05.11: временные стопы остатка выключаются только после ПОЛНОГО исполнения TP1 (при частичном действуют);
+# защита +0,3 % включается, только когда расчётный общий netPnL (комиссии и резерв — один раз) этот уровень достиг
+MAIN_TP_TRAIL = replace(MAIN_TP_TRAIL, guard_arm=True)
+MAIN_TP_TRAIL_NT = replace(MAIN_TP_TRAIL_NT, guard_arm=True)
+# исследование (клиент 05.11): полный TP +2 % на всю позицию и trailing всей позиции без TP — trailing 5 % от пика
+# exitVWAP всей позиции включается, когда exitVWAP достиг цены входа +2 % (уровень TP1); дальше — как MAIN_TP_TRAIL_NT
+MAIN_TP_FULL = replace(MAIN_V21, name="MAIN_TP_FULL", tp=((2, 1.0),), max_hold_ms=30_000)
+MAIN_TRAIL_ALL = replace(MAIN_TP_TRAIL_NT, name="MAIN_TRAIL_ALL", tp=(), trail_all_at=2.0)
+MAIN_EARLY_EXITS = (MAIN_V21, MAIN_TP_TRAIL, MAIN_TP_TRAIL_NT, MAIN_TP_FULL, MAIN_TRAIL_ALL)
 
 
 def find_cap(symbol: str) -> tuple[float, str] | None:
@@ -225,7 +239,11 @@ class Sim:
     Q: float = 0.0
     fees: float = 0.0
     tps: list = field(default_factory=list)
-    tp1_done: bool = False
+    tp1_done: bool = False  # TP1 исполнен хотя бы частично (у MAIN_TRAIL_ALL — trailing всей позиции включён)
+    tp1_full: bool = False  # TP1 исполнен целиком (у MAIN_TRAIL_ALL — одновременно с tp1_done)
+    tp1_full_ms: int = 0
+    guard_armed: bool = False
+    entry_px: float = 0.0
     tp_fills: int = 0
     mfe_trail: float = -1e9
     mfe_stop: float = -1e9
@@ -283,7 +301,13 @@ class Sim:
                            book_imbalance07=(d_bid - d_ask) / max(d_bid + d_ask, 1e-9),
                            rise_from_first_pct=100 * (ba / first - 1) if first else None,
                            rise_from_first_ask_pct=100 * (ba / book.first_ask - 1) if book.first_ask else None,
-                           ups_at_decision=book.activity(t)[0])
+                           ups_at_decision=book.activity(t)[0],
+                           decision_recv_ms=book.recv_t, decision_exch_ms=book.exch_t,
+                           decision_reconstructed=book.recv_t is not None and book.recv_t != t)
+        if self.flt["mom_ms"]:  # разложение импульса: Δmid = ΔbestBid + Δспреда / 2
+            past = book.px_ago(t, self.flt["mom_ms"])
+            self.result.update(mom_bid_pct=100 * (bb / past[1] - 1),
+                               mom_spread_half_pct=50 * ((ba - bb) - (past[2] - past[1])) / past[1])
         self.buy_at = t + self.latency
         self.state = "BUY_SENT"
 
@@ -317,8 +341,13 @@ class Sim:
             past = book.px_ago(t, f["mom_ms"])
             if past is None:
                 return False, "momentum_not_ready", None
+            d_mid = (bb + ba - past[1] - past[2]) / 2
+            d_spread = (ba - bb) - (past[2] - past[1])
             bid_ok = bb >= past[1] + self.step * 0.999 if f["mom_strict"] else bb >= past[1]
-            if not (bb + ba > past[1] + past[2] and bid_ok):
+            # строгий: рост середины не только от расширения спреда: Δmid − Δспреда/2 (= ΔbestBid) > 0;
+            # при bestBid +1 шаг выполняется всегда, проверка оставлена явной
+            wide_only = f["mom_strict"] and d_mid - d_spread / 2 <= 0
+            if not (d_mid > 0 and bid_ok) or wide_only:
                 return False, "no_momentum", None
         if f["max_spread"] is not None and 100 * (ba - bb) / mid > f["max_spread"]:
             return False, "spread", None
@@ -402,6 +431,7 @@ class Sim:
             return
         cost = cost_raw * got / got_raw
         avg = cost / got
+        self.entry_px = avg
         fee = self.opts.fee
         self.entry_ms = t
         self.C, self.Q = (cost, got * (1 - fee)) if self.opts.fee_in_coin else (cost * (1 + fee), got)
@@ -465,6 +495,8 @@ class Sim:
                     self.tp1_done = True
                     self.evs.clear()  # exitVWAP другого количества несравним
                     self.peak_ev = 0.0
+                if tp is self.tps[0] and tp.left <= 1e-12 and not self.tp1_full:
+                    self.tp1_full, self.tp1_full_ms = True, t
         if all(tp.left <= 1e-12 for tp in self.tps) and self.tps:
             if floor_step(self.Q, self.qty_step) * price < MIN_NOTIONAL:
                 self.close(t, "TP_FILLED")
@@ -521,20 +553,27 @@ class Sim:
         ev_1s, ev_2s = self.ago(self.evs, t, 1000), self.ago(self.evs, t, 2000)
         if not self.tp1_done and p.trail_act is not None and self.mfe_trail >= p.trail_act:
             self.trail_armed = True
+        if p.trail_all_at is not None and not self.tp1_done and ev >= self.entry_px * (1 + p.trail_all_at / 100):
+            self.tp1_done, self.tp1_full, self.tp1_full_ms = True, True, t  # trailing всей позиции включён
+        if p.guard_target is not None and self.tp1_done and stressed >= p.guard_target:
+            self.guard_armed = True
         if self.tp1_done or p.grace_ms:
             self.peak_ev = max(self.peak_ev, ev)
         if p.grace_ms:
             self.check_exit_early(t, ev, plain, stressed, depth_hit, in_grace, last_trade, trade_1s, ev_1s)
             return
         spread = 100 * (ba - bb) / ((ba + bb) / 2) if ba > bb > 0 else 0.0
-        time_stops = p.time_stops and (p.time_stops_after_tp1 or not self.tp1_done)
+        time_stops = p.time_stops and (p.time_stops_after_tp1 or not self.tp1_full)
+        # NO_MOMENTUM по ТЗ v2.1 — до TP1; в профиле без временных стопов после TP1 — до полного исполнения TP1
+        no_mom_on = not (self.tp1_done if p.time_stops_after_tp1 else self.tp1_full)
+        guard_on = self.tp1_done and (self.guard_armed or not p.guard_arm)
         checks = [
             ("DEPTH_DISAPPEARED", depth_hit),
             ("HARD_STOP", basis <= p.hard),
             ("FAST_WINDOW_DUMP", last_trade and trade_1s and 100 * (last_trade / trade_1s - 1) <= p.window_dump),
             ("BID_VWAP_DROP", p.bid_vwap_drop is not None and ev_1s and 100 * (ev / ev_1s - 1) <= p.bid_vwap_drop),
             ("FAST_DROP_STOP", elapsed <= 3000 and basis <= p.fast_drop),
-            ("TOTAL_PNL_PROTECT", p.guard_target is not None and self.tp1_done and stressed <= p.guard_target),
+            ("TOTAL_PNL_PROTECT", p.guard_target is not None and guard_on and stressed <= p.guard_target),
             ("TRAILING", self.trail_armed and not self.tp1_done and stressed <= self.mfe_trail - p.trail_pp),
             ("TRAILING_AFTER_TP1", p.trail_after_tp1 is not None and self.tp1_done
              and ev <= self.peak_ev * (1 - p.trail_after_tp1 / 100)),
@@ -542,7 +581,7 @@ class Sim:
             ("TIME_STOP_NEGATIVE", time_stops and elapsed >= p.time_neg[0] and basis < p.time_neg[1]),
             ("TIME_STOP_NO_EDGE", time_stops and elapsed >= p.no_edge[0]
              and basis < p.no_edge[1] + (spread if p.no_edge_plus_spread else 0)),
-            ("TIME_STOP_NO_MOMENTUM", time_stops and elapsed >= p.no_momentum_ms and not self.tp1_done
+            ("TIME_STOP_NO_MOMENTUM", time_stops and elapsed >= p.no_momentum_ms and no_mom_on
              and ev_2s and ev <= ev_2s),
             ("MAX_HOLD", elapsed >= p.max_hold_ms),
         ]
@@ -626,7 +665,9 @@ class Sim:
             gap = 100 * (self.exit_rev / self.exit_sold / self.exit_ev - 1)
         self.result.update(exit_ms=t, reason=reason, detail=self.exit_detail, pnl_usdt=pnl_usdt,
                            pnl_pct=100 * pnl_usdt / self.C, hold_s=(t - self.entry_ms) / 1000,
-                           mfe=self.mfe, mae=self.mae, tp1=self.tp1_done, tp_fills=self.tp_fills,
+                           mfe=self.mfe, mae=self.mae, tp1=self.tp1_done, tp1_full=self.tp1_full,
+                           tp1_full_s=(self.tp1_full_ms - self.entry_ms) / 1000 if self.tp1_full else None,
+                           guard_armed=self.guard_armed, tp_fills=self.tp_fills,
                            exit_rounds=self.exit_round, critical=self.critical_used, exit_gap_pct=gap,
                            left_qty=self.Q, left_usdt=self.Q * self.last_bid, fees_usdt=self.fees,
                            min_depth07_x=self.min_d07, min_depth15_x=self.min_d15, grace_liq_s=self.grace_liq_s)
@@ -718,7 +759,7 @@ def make_main_sims(cfg, opts: Opts, open_ms: int, step: float, qty_step: float, 
                        bid07=d, bid15=2 * d, max_book_age=age)
             label = f"W{w} C{c}{'t' if ref == 'trade' else ''} M{m}{'s' if strict else ''} D{d} A{age}"
             sims += [Sim("MAIN_EARLY", label, flt, usdt, prof, lat, opts, open_ms, step, qty_step, band_up, price_cap)
-                     for prof in (MAIN_V21, MAIN_TP_TRAIL, MAIN_TP_TRAIL_NT) for lat in cfg.latency
+                     for prof in MAIN_EARLY_EXITS for lat in cfg.latency
                      for usdt in grid["usdt"]]
     return sims
 
@@ -761,9 +802,12 @@ class CapEngine:
         self.sims: list[Sim] = []
         self.last_t = 0
 
-    def on_event(self, t: int, kind: str, data) -> None:
+    def on_event(self, t: int, kind: str, data, recv_t: int | None = None, exch_t: int | None = None) -> None:
+        """recv_t — время получения кадра (localReceiveTime), exch_t — время биржи (sendTime кадра); t — время модели
+        (равно recv_t, кроме кадров, восстановленных по sendTime после остановки записи)."""
         self.last_t = t
         book = self.book
+        book.recv_t, book.exch_t = recv_t, exch_t
         for s in self.sims:
             if s.state != "DONE":
                 s.before_event(t, book)
@@ -836,6 +880,7 @@ class MainEngine(CapEngine):
         self.first_trade_ms: int | None = None
         self.first_exec: dict[float, tuple[int, float]] = {}  # план USDT → (время, bestAsk)
         self.last_trade_px: float | None = None
+        self.book_gaps: list[list] = []  # [начало, конец] интервалов, когда стакан после разрыва версий недействителен
 
     def exchange_open_ms(self) -> int | None:
         v = (self.info or {}).get("firstOpenTime")
@@ -851,7 +896,7 @@ class MainEngine(CapEngine):
     def near_open(self, t: int) -> bool:
         return self.open_ms is None or t >= self.open_ms - self.PRE_MS
 
-    def on_event(self, t: int, kind: str, data) -> None:
+    def on_event(self, t: int, kind: str, data, recv_t: int | None = None, exch_t: int | None = None) -> None:
         book = self.book
         if self.open_ms is None and self.exchange_open_ms():
             self.open_ms = self.cand_ms = self.exchange_open_ms()
@@ -861,7 +906,12 @@ class MainEngine(CapEngine):
                 book.first_trade, self.first_trade_ms = data[0], t  # опоры для ограничения роста и отчёта
                 if self.open_ms is None:
                     self.open_ms = self.cand_ms = t  # официального времени нет — открытие по первой сделке
-        super().on_event(t, kind, data)
+        was_valid = book.valid
+        super().on_event(t, kind, data, recv_t, exch_t)
+        if was_valid and not book.valid:
+            self.book_gaps.append([t, None])  # разрыв версий стакана: до нового снимка входить нельзя
+        elif book.valid and self.book_gaps and self.book_gaps[-1][1] is None:
+            self.book_gaps[-1][1] = t
         if not book.valid or not self.near_open(t):
             return
         bb, ba = book.best()
@@ -894,4 +944,5 @@ class MainEngine(CapEngine):
         return dict(t0_ms=self.open_ms, exchange_open_ms=self.exchange_open_ms(),
                     first_book_rel_ms=rel(self.first_book_ms), first_ask=self.book.first_ask,
                     first_trade_rel_ms=rel(self.first_trade_ms), first_trade=self.book.first_trade,
-                    first_exec={f"{u:g}": dict(rel_ms=rel(v[0]), ask=v[1]) for u, v in self.first_exec.items()})
+                    first_exec={f"{u:g}": dict(rel_ms=rel(v[0]), ask=v[1]) for u, v in self.first_exec.items()},
+                    book_gaps_rel_ms=[[rel(a), rel(b)] for a, b in self.book_gaps])

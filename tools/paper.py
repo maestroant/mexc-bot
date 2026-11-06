@@ -26,9 +26,9 @@ from argparse import Namespace
 from datetime import datetime
 
 from cap_replay import brief
-from core.cap_breakout import (EARLY_USDT, MAIN_EARLY_PAPER, ORDER_USDT, CapEngine, MainEngine, Opts, find_cap,
-                               market_params, no_entry_reason)
-from core.feed import events_of
+from core.cap_breakout import (EARLY_USDT, MAIN_EARLY_PAPER, ORDER_USDT, PREREG_ID, CapEngine, MainEngine, Opts,
+                               find_cap, market_params, no_entry_reason)
+from core.feed import events_of, frame_meta
 from core.live import LiveFeed
 from notify import notify
 from probe_listing import ROOT, Client, load_dotenv
@@ -85,11 +85,12 @@ class Paper:
         events = events_of(entry)
         if not events:
             return
+        meta = frame_meta(entry)
         started = time.perf_counter()
         for name, eng in self.engines.items():
             if not self.done.get(name):
                 for t, kind, ev in events:
-                    eng.on_event(t, kind, ev)
+                    eng.on_event(t, kind, ev, *meta)
         self.proc_ms.append(1000 * (time.perf_counter() - started))
         main = self.engines["main"]  # T0 — по единой модели ядра: официальное время, иначе стакан или первая сделка
         if self.open_ms is None and main.open_ms is not None and events[-1][0] >= main.open_ms:
@@ -106,7 +107,7 @@ class Paper:
             return
         if name not in self.states:
             self.states[name] = ["SCAN"] * len(eng.sims)
-            self.write("START", engine=name, start_ms=eng.release, sims=len(eng.sims),
+            self.write("START", engine=name, start_ms=eng.release, sims=len(eng.sims), prereg=PREREG_ID,
                        t_from_open_s=(eng.release - self.open_ms) / 1000)
             self.log(f"{name}: ветки запущены на T+{(eng.release - self.open_ms) / 1000:.1f} с, веток {len(eng.sims)}")
         states = self.states[name]
@@ -185,7 +186,7 @@ class Paper:
                    proc_max_ms=max(self.proc_ms, default=0.0),
                    delay_over_best_p50_ms=pct(self.delay_ms, 0.5) - base,
                    delay_over_best_p99_ms=pct(self.delay_ms, 0.99) - base)
-        self.write("SUMMARY", result=result, cap=self.cap, open_ms=self.open_ms, lag=lag, rows=rows,
+        self.write("SUMMARY", result=result, cap=self.cap, open_ms=self.open_ms, lag=lag, rows=rows, prereg=PREREG_ID,
                    times=self.engines["main"].times())
         self.log(f"готово: {result}; задержки {lag}")
         if self.open_ms is not None:

@@ -36,10 +36,12 @@ from pathlib import Path
 
 from core.cap_breakout import (HOLD_MARKS_S, KNOWN_CAPS, LOGS, MAIN_EARLY_GRID, ORDER_USDT, MainEngine, Opts,
                                find_cap, no_entry_reason)
-from core.feed import events_of, frame_time, iter_lines, line_t, ws_base_lag
+from core.feed import events_of, frame_meta, frame_time, iter_lines, line_t, ws_base_lag
 
 PROFILE_LABEL = {"MAIN_V21": "стандартный", "MAIN_NO_TIME_STOPS": "без врем. стопов", "MAIN_TP_TRAIL": "TP1+trailing",
-                 "MAIN_TP_TRAIL_NT": "TP1+trail, без вр.ст."}
+                 "MAIN_TP_TRAIL_NT": "TP1+trail, без вр.ст.", "MAIN_TP_FULL": "полный TP +2 %",
+                 "MAIN_TRAIL_ALL": "trailing всей поз."}
+RECON = "reconstructed"  # качество: интервал восстановлен по sendTime после остановки записи — не для выводов
 SKIP_SYMBOLS = {"PFPUSDT": "делистинг, не листинг", "PALUSDT": "листинг отменён"}
 GROUPS = {"no_cap": "Без потолка", "cap": "С потолком (замороженные)", "api": "API закрыт в начальном окне"}
 
@@ -93,16 +95,19 @@ def load_open(path: Path, before_ms: int = 60_000, after_ms: int = 120_000):
         info = dict(info, firstOpenTime=first_open)
     base = ws_base_lag(entries)
     stalled = [e for e in entries if frame_time(e, base) != e["t"]]
-    events = sorted((ev for e in entries for ev in events_of(e, base) if ev[0] <= hi), key=lambda ev: ev[0])
+    events = sorted((ev + frame_meta(e) for e in entries for ev in events_of(e, base) if ev[0] <= hi),
+                    key=lambda ev: ev[0])
+    fixed = [frame_time(e, base) for e in stalled]
     times = dict(exchange_open_ms=first_open, detected_rel_ms=detected - t0, stalled_frames=len(stalled),
-                 stall_max_ms=max((e["t"] - frame_time(e, base) for e in stalled), default=0))
+                 stall_max_ms=max((e["t"] - frame_time(e, base) for e in stalled), default=0),
+                 recon_span=[min(fixed), max(fixed)] if fixed else None)
     return t0, events, info, times
 
 
 def trajectory(events: list, open_ms: int, ref: float | None = None) -> dict:
     """Ход цены сделок за первые 60 с от ref (первый действительный ask; нет — первая сделка): максимум (и когда),
     минимум, на 60-й секунде. Первая сделка бывает случайным принтом (EMYA: 0,03 при рынке 0,055)."""
-    deals = [(t, d[0]) for t, kind, d in events if kind == "deal" and open_ms <= t <= open_ms + 60_000]
+    deals = [(t, d[0]) for t, kind, d, *_ in events if kind == "deal" and open_ms <= t <= open_ms + 60_000]
     if not deals:
         return {}
     first = ref or deals[0][1]
@@ -133,15 +138,42 @@ def run_listing(path: Path, args) -> tuple[list[dict], dict]:
     meta.update(status="ok", group="cap" if cap else "no_cap")
     opts = Opts(fee=(args.fee or 0.08) / 100, fee_from_info=args.fee is None)
     engine = MainEngine(args, opts, open_ms, info, cap[0] if cap else None)
-    for t, kind, data in events:
-        engine.on_event(t, kind, data)
+    for t, kind, data, recv, exch in events:
+        engine.on_event(t, kind, data, recv, exch)
     engine.finish(events[-1][0])
     meta["traj"] = trajectory(events, open_ms, engine.book.first_ask)
     meta["times"].update(engine.times())
+    span = unreliable_span(meta["times"], engine.book_gaps, open_ms)
     rows = engine.rows(symbol)
     for r in rows:
         r["open_ms"] = open_ms
+        r["data_quality"] = RECON if span and span[0] <= row_end(r, open_ms) and span[1] >= open_ms else "ok"
+    meta["data_quality"] = RECON if any(r["data_quality"] == RECON for r in rows) else "ok"
     return rows, meta
+
+
+def unreliable_span(times: dict, book_gaps: list, open_ms: int) -> list | None:
+    """Интервал (время модели), где данные восстановлены по sendTime после остановки записи; если за остановкой
+    стакан стал недействителен (потеряны diff-ы, KAMIRAI) — до нового снимка. Выводы по нему не делаются."""
+    span = times.get("recon_span")
+    if not span:
+        return None
+    lo, hi = span
+    for a, b in book_gaps:
+        if a <= hi + 500:
+            hi = max(hi, b if b is not None else hi)
+    times["unreliable_rel_ms"] = [lo - open_ms, hi - open_ms]
+    return [lo, hi]
+
+
+def row_end(r: dict, open_ms: int) -> int:
+    """Конец интервала, от которого зависит строка: выход, а без входа — конец окна входа (от T0)."""
+    if r.get("exit_ms"):
+        return r["exit_ms"]
+    m = re.match(r"W(\d+) ", r.get("variant") or "")
+    if m:
+        return open_ms + int(m.group(1)) * 1000
+    return open_ms + (30_000 if "30" in (r.get("variant") or "") else 8_000)
 
 
 def mean(xs):
@@ -207,11 +239,42 @@ def print_moments(metas: list[dict]) -> None:
             tr = m.get("traj") or {}
             path_txt = (f"; цена сделок к первому ask: 1 с {tr['at1_pct']:+.0f} %, 5 с {tr['at5_pct']:+.0f} %"
                         if tr.get("at1_pct") is not None and tr.get("at5_pct") is not None else "")
-            stall = (f"; запись стояла до {tm['stall_max_ms']} мс — время кадров исправлено по sendTime"
-                     if tm.get("stalled_frames") else "")
+            un = tm.get("unreliable_rel_ms")
+            stall = (f"; запись стояла до {tm['stall_max_ms']} мс — кадры восстановлены по sendTime, интервал "
+                     f"{un[0]:+}…{un[1]:+} мс помечен {RECON}" if un else "")
             print(f"    {short(m['symbol']):<9} стакан +{tm['first_book_rel_ms']} (ask {ask:.6g}), первая сделка "
                   f"+{tm.get('first_trade_rel_ms')} ({rise(tm.get('first_trade'))}), BUY исполним целиком: "
                   f"{exec_txt}{path_txt}{stall}")
+
+
+def evaluate(rs: list[dict]) -> dict:
+    """Оценка набора сделок не только по итогу (клиент 05.11): худшая сделка, итог без лучшего листинга,
+    исполненный объём."""
+    by_sym = defaultdict(float)
+    for r in rs:
+        by_sym[r["symbol"]] += r["pnl_usdt"]
+    total = sum(by_sym.values())
+    best_sym = max(by_sym, key=by_sym.get) if by_sym else None
+    return dict(n=len(rs), total=total, wins=sum(r["pnl_usdt"] > 0 for r in rs),
+                worst_pct=min((r["pnl_pct"] for r in rs), default=0.0),
+                worst_usdt=min((r["pnl_usdt"] for r in rs), default=0.0),
+                best_sym=best_sym, wo_best=total - max(by_sym[best_sym], 0.0) if best_sym else 0.0,
+                volume=sum(r["buy_usdt"] for r in rs), left=sum(r["left_usdt"] for r in rs))
+
+
+def eval_text(rs_all: list[dict]) -> str:
+    ok = [r for r in rs_all if "pnl_usdt" in r and r.get("data_quality") != RECON]
+    rec = [r for r in rs_all if "pnl_usdt" in r and r.get("data_quality") == RECON]
+    e = evaluate(ok)
+    txt = (f"входов {e['n']}, {e['wins']}/{e['n'] - e['wins']}, итог {e['total']:+.2f} USDT, без лучшего листинга"
+           f"{' (' + short(e['best_sym']) + ')' if e['best_sym'] else ''} {e['wo_best']:+.2f}, худшая "
+           f"{e['worst_usdt']:+.2f} USDT ({e['worst_pct']:+.1f} %), куплено {e['volume']:.1f} USDT, "
+           f"остаток {e['left']:.2f}")
+    if rec:
+        er = evaluate(rec)
+        txt += (f"; отдельно, восстановленные данные: входов {er['n']}, итог {er['total']:+.2f} "
+                f"({', '.join(sorted({short(r['symbol']) for r in rec}))})")
+    return txt
 
 
 def stat_line(rs_all: list[dict]) -> str:
@@ -225,7 +288,9 @@ def stat_line(rs_all: list[dict]) -> str:
             f"{mean([r['mae'] for r in rs]):+.1f} %, куплено {sum(r['buy_usdt'] for r in rs):.1f}, "
             f"остаток {sum(r['left_usdt'] for r in rs):.2f}; вход ср. +{mean([(r['entry_ms'] - r['open_ms']) / 1000 for r in rs]):.1f} с, "
             f"рост до входа ср. {mean([r.get('rise_from_first_pct') for r in rs]):+.0f} %; если держать 10 с "
-            f"{mean([r['hold_marks'].get(10) for r in rs]):+.1f} %")
+            f"{mean([r['hold_marks'].get(10) for r in rs]):+.1f} %"
+            + (f"; из них на восстановленных данных: {', '.join(rec)}" if (rec := sorted(
+                {short(r['symbol']) for r in rs if r.get('data_quality') == RECON})) else ""))
 
 
 def print_baseline_summary(rows: list[dict], metas: list[dict], latency: int, usdt: float) -> None:
@@ -252,6 +317,13 @@ def print_early(rows: list[dict], metas: list[dict], latency: int, top: int) -> 
     early = [r for r in rows if r["mode"] == "MAIN_EARLY" and r["latency"] == latency]
     if not early:
         return
+    rec = [r for r in early if r.get("data_quality") == RECON]
+    if rec:
+        print(f"\nMAIN_EARLY: строки с восстановленными данными ({RECON}: "
+              f"{', '.join(sorted({short(r['symbol']) for r in rec}))}) в рейтинг и выводы не входят; отдельно — "
+              f"{len(rec)} строк, входов {sum('pnl_usdt' in r for r in rec)}, итог "
+              f"{sum(r.get('pnl_usdt', 0.0) for r in rec):+.2f} USDT")
+    early = [r for r in early if r.get("data_quality") != RECON]
     combos = defaultdict(list)
     for r in early:
         combos[(r["variant"], r["profile"], r["usdt"])].append(r)
@@ -281,14 +353,14 @@ def print_early(rows: list[dict], metas: list[dict], latency: int, top: int) -> 
               f"  {mean([r.get('rise_from_first_ask_pct') for r in rs]):>+15.0f}"
               f"  {mean([r['decision_spread_pct'] for r in rs]):>7.2f}"
               f"  {mean([r['decision_bid07_usdt'] for r in rs]):>11.0f}  {mean([r['hold_marks'].get(10) for r in rs]):>+14.1f}")
-    exits = defaultdict(lambda: [0.0, 0, 0.0])
-    for r in early:
-        if "pnl_usdt" in r and r["usdt"] == ORDER_USDT:
-            e = exits[r["profile"]]
-            e[0], e[1], e[2] = e[0] + r["pnl_usdt"], e[1] + 1, e[2] + r["left_usdt"]
-    print(f"\nВыходы на одних и тех же входах (все комбинации, план {ORDER_USDT:g} USDT): "
-          + "; ".join(f"{PROFILE_LABEL[k]} — входов {v[1]}, итог {v[0]:+.2f} USDT, остаток {v[2]:.2f}"
-                      for k, v in sorted(exits.items())))
+    print(f"\nВыходы на одних и тех же входах (все комбинации, по планам; без восстановленных данных):")
+    for usdt in sorted({r["usdt"] for r in early}):
+        for prof in PROFILE_LABEL:
+            rs = [r for r in early if r["profile"] == prof and r["usdt"] == usdt]
+            if rs:
+                single = sum(1 for r in rs if r.get("single_tp"))
+                print(f"  {usdt:>4g} USDT  {PROFILE_LABEL[prof]:<22} {eval_text(rs)}"
+                      + (f"; единый TP у {single}" if single else ""))
     for robust_total, total, (variant, prof, usdt), rs, rs_all in stats[:1]:
         print(f"\nЛучшая комбинация {variant}, выход {PROFILE_LABEL[prof]}, {usdt:g} USDT — по листингам:")
         for r in sorted(rs_all, key=lambda r: r["symbol"]):
