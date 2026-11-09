@@ -120,8 +120,8 @@ class Paper:
             self.log(f"журнал кадров: {self.journal_path}")
         self.journal_closed = True
 
-    def jevent(self, name: str, **data) -> None:
-        self.jwrite({"t": self.feed.t(), "src": "event", "ch": name, "data": data})
+    def jevent(self, name: str, t: int | None = None, **data) -> None:
+        self.jwrite({"t": self.feed.t() if t is None else t, "src": "event", "ch": name, "data": data})
 
     def on_feed_event(self, name: str, **data) -> None:
         self.write(name, **data)
@@ -204,6 +204,7 @@ class Paper:
         if self.open_ms is None and main.open_ms is not None and events[-1][0] >= main.open_ms:
             self.open_ms = main.open_ms
             self.write("OPEN", open_ms=self.open_ms, exchange_open_ms=main.exchange_open_ms())
+            self.jevent("OPEN_DETECTED", t=events[-1][0], open_ms=self.open_ms)  # по нему журнал читают main_replay и paper_vs_replay
             self.log("открытие: основная стратегия идёт, жду потолок из лога пробы")
         for name in self.engines:
             self.track(name)
