@@ -137,7 +137,7 @@ class Recorder:
         while not self.stop.is_set():
             try:
                 async with websockets.connect(url, ping_interval=None, max_size=None, open_timeout=15) as ws:
-                    self.event("WS_CONNECTED", src=src)
+                    self.event("WS_CONNECTED", src=src, remote=str(ws.remote_address))
                     await ws.send(json.dumps({"method": "SUBSCRIPTION", "params": channels}))
                     pinger = asyncio.create_task(self.ws_pinger(ws))
                     try:
@@ -235,7 +235,8 @@ class Recorder:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.stop.set)
-        self.event("START", file=str(self.path), duration=self.args.duration, max_wait_h=self.args.max_wait)
+        self.event("START", file=str(self.path), duration=self.args.duration, max_wait_h=self.args.max_wait,
+                   clock_offset_ms=self.client.time_offset_ms)
         tasks = [
             asyncio.create_task(self.ws_loop("ws_pub", WS_URL, public_channels(self.sym))),
             asyncio.create_task(self.rest_loop()),

@@ -117,7 +117,8 @@ class Client:
     def sync_time(self) -> None:
         r = self.call("GET", "/api/v3/time")
         if r.ok:
-            self.time_offset_ms = r.body["serverTime"] - now_ms() - int(r.latency_ms / 2)
+            # serverTime соответствует середине запроса: локальное «после ответа» − RTT/2
+            self.time_offset_ms = r.body["serverTime"] - now_ms() + int(r.latency_ms / 2)
 
     def call(self, method: str, path: str, params: dict | None = None, signed: bool = False) -> Resp:
         params = dict(params or {})

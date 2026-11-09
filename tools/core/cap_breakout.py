@@ -46,6 +46,9 @@ MAIN_EARLY_GRID = dict(window_s=(1, 2, 3, 5), chase=(20, 40, 60), chase_ref=("as
 # предрегистрация (клиент 05.11): варианты, которые сравниваются на новых листингах, зафиксированы до их появления
 # (doc/preregistratsiya.md); менять — только новым PREREG_ID и только для листингов после изменения
 PREREG_ID = "PR-2026-11-06"
+# версия модели исполнения (задержка, BUY IOC + ожидание, TP в очереди уровня, срочный выход LIMIT −0,5 % × 3, затем
+# по bids до −20 %); меняется при любом изменении правил исполнения — пишется в журнал PAPER
+EXEC_MODEL_ID = "EXEC-2026-11-09"
 MAIN_EARLY_PAPER = dict(window_s=(2, 5), chase=(40,), chase_ref=("ask",),
                         momentum=((0, False), (250, False), (250, True)), depth_x=(5,), book_age=(100, 250, 500),
                         usdt=(2.0, 10.0))  # 18 комбинаций × 5 выходов × 2 плана
@@ -887,7 +890,10 @@ class MainEngine(CapEngine):
         return int(v) if v else None
 
     def try_start(self, t: int, kind: str, data) -> None:
-        if self.open_ms is not None and t >= self.open_ms and self.book.valid:
+        # ветки — с T0, но только когда рынок действительно открылся (двусторонний стакан или сделка у T0): биржа
+        # переносит открытие (KOR 03.11: firstOpenTime менялся дважды), и старое время не должно запускать ветки
+        opened = self.book.first_ask is not None or self.first_trade_ms is not None
+        if self.open_ms is not None and t >= self.open_ms and self.book.valid and opened:
             self.release = t
             step, qty_step, band_up, _ = market_params(self.info)
             self.sims = make_main_sims(self.cfg, with_fees(self.opts, self.info), self.open_ms, step, qty_step,
@@ -898,8 +904,9 @@ class MainEngine(CapEngine):
 
     def on_event(self, t: int, kind: str, data, recv_t: int | None = None, exch_t: int | None = None) -> None:
         book = self.book
-        if self.open_ms is None and self.exchange_open_ms():
-            self.open_ms = self.cand_ms = self.exchange_open_ms()
+        xo = self.exchange_open_ms()
+        if xo and self.release is None and self.open_ms != xo and book.first_ask is None and self.first_trade_ms is None:
+            self.open_ms = self.cand_ms = xo  # пока рынок не открылся, T0 следует за последним firstOpenTime биржи
         if kind == "deal":
             self.last_trade_px = data[0]
             if book.first_trade is None and self.near_open(t):

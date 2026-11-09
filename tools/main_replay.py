@@ -97,10 +97,14 @@ def load_open(path: Path, before_ms: int = 60_000, after_ms: int = 120_000):
     stalled = [e for e in entries if frame_time(e, base) != e["t"]]
     events = sorted((ev + frame_meta(e) for e in entries for ev in events_of(e, base) if ev[0] <= hi),
                     key=lambda ev: ev[0])
-    fixed = [frame_time(e, base) for e in stalled]
+    spans = []  # интервалы восстановленных кадров (время модели); разрыв > 2 с — новый интервал
+    for ft in sorted(frame_time(e, base) for e in stalled):
+        if spans and ft - spans[-1][1] <= 2000:
+            spans[-1][1] = ft
+        else:
+            spans.append([ft, ft])
     times = dict(exchange_open_ms=first_open, detected_rel_ms=detected - t0, stalled_frames=len(stalled),
-                 stall_max_ms=max((e["t"] - frame_time(e, base) for e in stalled), default=0),
-                 recon_span=[min(fixed), max(fixed)] if fixed else None)
+                 stall_max_ms=max((e["t"] - frame_time(e, base) for e in stalled), default=0), recon_spans=spans)
     return t0, events, info, times
 
 
@@ -143,33 +147,34 @@ def run_listing(path: Path, args) -> tuple[list[dict], dict]:
     engine.finish(events[-1][0])
     meta["traj"] = trajectory(events, open_ms, engine.book.first_ask)
     meta["times"].update(engine.times())
-    span = unreliable_span(meta["times"], engine.book_gaps, open_ms)
+    spans = unreliable_spans(meta["times"], engine.book_gaps, open_ms)
     rows = engine.rows(symbol)
+    hit = lambda lo, hi: any(a <= hi and b >= lo for a, b in spans)  # noqa: E731
     for r in rows:
         r["open_ms"] = open_ms
-        r["data_quality"] = RECON if span and span[0] <= row_end(r, open_ms) and span[1] >= open_ms else "ok"
+        # качество — по интервалу входа (T0 − 2 с … конец окна), одинаковому для всех выходов: исключение строки
+        # не должно зависеть от того, сколько держали позицию; восстановленные кадры в удержании — отдельная пометка
+        r["data_quality"] = RECON if hit(open_ms - MainEngine.PRE_MS, window_end(r, open_ms)) else "ok"
+        if r.get("exit_ms") and r["data_quality"] == "ok" and hit(r["entry_ms"], r["exit_ms"]):
+            r["exit_quality"] = RECON
     meta["data_quality"] = RECON if any(r["data_quality"] == RECON for r in rows) else "ok"
     return rows, meta
 
 
-def unreliable_span(times: dict, book_gaps: list, open_ms: int) -> list | None:
-    """Интервал (время модели), где данные восстановлены по sendTime после остановки записи; если за остановкой
-    стакан стал недействителен (потеряны diff-ы, KAMIRAI) — до нового снимка. Выводы по нему не делаются."""
-    span = times.get("recon_span")
-    if not span:
-        return None
-    lo, hi = span
-    for a, b in book_gaps:
-        if a <= hi + 500:
-            hi = max(hi, b if b is not None else hi)
-    times["unreliable_rel_ms"] = [lo - open_ms, hi - open_ms]
-    return [lo, hi]
+def unreliable_spans(times: dict, book_gaps: list, open_ms: int) -> list[list]:
+    """Интервалы (время модели), где кадры восстановлены по sendTime после остановки записи; если за остановкой
+    стакан стал недействителен (потеряны diff-ы, KAMIRAI) — до нового снимка. Выводы по ним не делаются."""
+    spans = [list(s) for s in times.get("recon_spans") or []]
+    for span in spans:
+        for a, b in book_gaps:
+            if span[0] - 500 <= a <= span[1] + 500 and b is not None:
+                span[1] = max(span[1], b)
+    times["unreliable_rel_ms"] = [[a - open_ms, b - open_ms] for a, b in spans]
+    return spans
 
 
-def row_end(r: dict, open_ms: int) -> int:
-    """Конец интервала, от которого зависит строка: выход, а без входа — конец окна входа (от T0)."""
-    if r.get("exit_ms"):
-        return r["exit_ms"]
+def window_end(r: dict, open_ms: int) -> int:
+    """Конец окна входа ветки от T0 (MAIN_EARLY — W из метки, BASELINE — 8 с или 30 с)."""
     m = re.match(r"W(\d+) ", r.get("variant") or "")
     if m:
         return open_ms + int(m.group(1)) * 1000
@@ -241,7 +246,7 @@ def print_moments(metas: list[dict]) -> None:
                         if tr.get("at1_pct") is not None and tr.get("at5_pct") is not None else "")
             un = tm.get("unreliable_rel_ms")
             stall = (f"; запись стояла до {tm['stall_max_ms']} мс — кадры восстановлены по sendTime, интервал "
-                     f"{un[0]:+}…{un[1]:+} мс помечен {RECON}" if un else "")
+                     + ", ".join(f"{a:+}…{b:+}" for a, b in un) + f" мс помечен {RECON}" if un else "")
             print(f"    {short(m['symbol']):<9} стакан +{tm['first_book_rel_ms']} (ask {ask:.6g}), первая сделка "
                   f"+{tm.get('first_trade_rel_ms')} ({rise(tm.get('first_trade'))}), BUY исполним целиком: "
                   f"{exec_txt}{path_txt}{stall}")
@@ -270,6 +275,9 @@ def eval_text(rs_all: list[dict]) -> str:
            f"{' (' + short(e['best_sym']) + ')' if e['best_sym'] else ''} {e['wo_best']:+.2f}, худшая "
            f"{e['worst_usdt']:+.2f} USDT ({e['worst_pct']:+.1f} %), куплено {e['volume']:.1f} USDT, "
            f"остаток {e['left']:.2f}")
+    ex = sum(1 for r in ok if r.get("exit_quality") == RECON)
+    if ex:
+        txt += f"; в удержании были восстановленные кадры у {ex}"
     if rec:
         er = evaluate(rec)
         txt += (f"; отдельно, восстановленные данные: входов {er['n']}, итог {er['total']:+.2f} "
