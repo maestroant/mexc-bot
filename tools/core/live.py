@@ -35,8 +35,8 @@ class LiveFeed:
     def t(self) -> int:
         return int(time.time() * 1000) + self.client.time_offset_ms
 
-    def emit(self, src: str, ch: str, data, conn: str = "A") -> None:
-        entry = {"t": self.t(), "src": src, "ch": ch, "conn": conn, "data": data}
+    def emit(self, src: str, ch: str, data, conn: str = "A", **extra) -> None:
+        entry = {"t": self.t(), "src": src, "ch": ch, "conn": conn, "data": data, **extra}
         (self.on_entry if conn == "A" else self.on_shadow)(entry)
 
     async def run(self, stop: asyncio.Event) -> None:
@@ -86,8 +86,8 @@ class LiveFeed:
 
     async def rest(self, ch: str, path: str, params: dict):
         r = await asyncio.to_thread(self.client.call, "GET", path, params)
-        if r.ok:
-            self.emit("rest", ch, r.body)
+        if r.ok:  # http и latency_ms — как в записи listing_recorder (время ответа REST, P0)
+            self.emit("rest", ch, r.body, http=r.http, latency_ms=round(r.latency_ms, 1))
         return r.body if r.ok else None
 
     async def rest_loop(self, stop: asyncio.Event) -> None:

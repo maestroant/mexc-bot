@@ -38,6 +38,7 @@ from probe_listing import ROOT, Client, load_dotenv
 LATENCY_MS = 50  # задержка ордера в модели — как в основном прогоне REPLAY
 JOURNAL_BEFORE_MS, JOURNAL_AFTER_MS = 120_000, 300_000  # журнал кадров PAPER: T0 − 2 мин … T0 + 5 мин
 LOOP_TICK_MS, LOOP_LAG_MS, SLOW_FRAME_MS = 10, 20, 20  # контроль цикла событий и медленных кадров
+PROC_FROM_MS, PROC_TO_MS = -2_000, 30_000  # время обработки каждого кадра A в журнал — в этом окне от T0
 
 
 def pct(xs: list[float], q: float) -> float:
@@ -148,8 +149,8 @@ class Paper:
         meta = dict(sendTime=data.get("sendTime"))
         if dep:
             meta.update(fromVersion=dep.get("fromVersion"), toVersion=dep.get("toVersion"))
-        if deals:
-            meta.update(deals=len(deals.get("deals", [])))
+        if deals:  # сделки без идентификаторов: сравнение соединений — по (время, цена, количество)
+            meta.update(deals=[[d.get("time"), d.get("price"), d.get("quantity")] for d in deals.get("deals", [])])
         self.jwrite({"t": entry["t"], "src": "ws_shadow", "ch": entry["ch"], "conn": "B", "data": meta})
 
     async def loop_monitor(self) -> None:
@@ -189,6 +190,8 @@ class Paper:
         if not events:
             return
         meta = frame_meta(entry)
+        book = self.engines["main"].book
+        was_valid = book.valid
         started = time.perf_counter()
         for name, eng in self.engines.items():
             if not self.done.get(name):
@@ -196,6 +199,12 @@ class Paper:
                     eng.on_event(t, kind, ev, *meta)
         proc = 1000 * (time.perf_counter() - started)
         self.proc_ms.append(proc)
+        t0 = self.t0_hint()
+        if book.valid != was_valid:  # стакан стал (не)действительным: разрыв версий или снимок
+            self.jevent("BOOK_VALID" if book.valid else "BOOK_INVALID", t=entry["t"], version=book.version,
+                        pending=len(book.pending), gaps=book.gaps, by=entry["src"])
+        if t0 is not None and t0 + PROC_FROM_MS <= entry["t"] <= t0 + PROC_TO_MS:
+            self.jevent("PROC", t=entry["t"], ms=round(proc, 3), version=book.version, valid=book.valid)
         if proc > SLOW_FRAME_MS:
             self.slow_frames += 1
             self.jevent("SLOW_FRAME", proc_ms=round(proc, 1), kinds=sorted({k for _, k, _ in events}),
@@ -222,6 +231,7 @@ class Paper:
                        t_from_open_s=(eng.release - self.open_ms) / 1000)
             self.log(f"{name}: ветки запущены на T+{(eng.release - self.open_ms) / 1000:.1f} с, веток {len(eng.sims)}")
         states = self.states[name]
+        decided: dict[tuple, int] = {}  # (время решения, версия стакана) → число веток
         for i, s in enumerate(eng.sims):
             prev, now = states[i], s.state
             if prev == now:
@@ -229,6 +239,12 @@ class Paper:
             states[i] = now
             tag = dict(engine=name, mode=s.mode, variant=s.variant, usdt=s.usdt, profile=s.profile.name)
             r = s.result
+            if prev == "SCAN" and r.get("decision_ms"):  # момент решения: время модели, получения кадра и биржи
+                self.write("DECISION", **tag, decision_ms=r["decision_ms"], recv_ms=r.get("decision_recv_ms"),
+                           exch_ms=r.get("decision_exch_ms"), version=eng.book.version, ask=s.decision_ask,
+                           limit=s.buy_limit)
+                k = (r["decision_ms"], eng.book.version)
+                decided[k] = decided.get(k, 0) + 1
             if now == "POSITION" and prev != "POSITION":
                 self.write("ENTRY", **tag, entry_ms=r["entry_ms"], entry_px=r["entry_px"], buy_usdt=r["buy_usdt"],
                            fill_pct=r["fill_pct"], slippage_pct=r["slippage_pct"],
@@ -241,6 +257,8 @@ class Paper:
                 else:
                     self.write("NO_ENTRY", **tag, reason=r.get("reason"), skips=r.get("skips"),
                                buy_misses=r.get("buy_misses"))
+        for (t, version), n in decided.items():
+            self.jevent("DECISION", t=t, engine=name, version=version, branches=n)
 
     # --- управление ---
     async def cap_loop(self) -> None:

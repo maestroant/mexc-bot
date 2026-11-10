@@ -75,10 +75,14 @@ class Book:
         self.version = int(d["lastUpdateId"])
         self.valid = True
         self.updates += 1
-        for diff in list(self.pending):
-            if int(diff["toVersion"]) > self.version:
-                self.diff(diff)
+        # ожидающие diff-ы новее снимка накладываются по порядку; если снимок старее первого из них (разрыв),
+        # diff() вернёт их в pending — они ждут следующего снимка. Раньше pending очищался и после неудачной
+        # попытки: если снимок приходил позже интервала опроса (ответ REST > 1 с), стакан не восстанавливался
+        # вовсе (P0, тест snap_delay_3000 в tools/p0_stress.py)
+        todo = [diff for diff in self.pending if int(diff["toVersion"]) > self.version]
         self.pending.clear()
+        for diff in todo:
+            self.diff(diff)
 
     def diff(self, d: dict) -> bool:
         fr, to = int(d["fromVersion"]), int(d["toVersion"])
