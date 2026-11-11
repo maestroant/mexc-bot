@@ -1,0 +1,193 @@
+{
+ "main": {
+  "BORDRUSDT": {
+   "replay": "cb910261155397ea",
+   "paper": "cb910261155397ea",
+   "rows": 372
+  },
+  "CHOMPUSDT": {
+   "replay": "0897d670aaf7e0f9",
+   "paper": "0897d670aaf7e0f9",
+   "rows": 372
+  },
+  "TAPEFOURUSDT": {
+   "replay": "8a0e9254f56c8e6a",
+   "paper": "8a0e9254f56c8e6a",
+   "rows": 372
+  },
+  "DNAUSDT": {
+   "replay": "3a393a474e5c4fe1",
+   "paper": "3a393a474e5c4fe1",
+   "rows": 372
+  },
+  "HDLRUSDT": {
+   "replay": "bd01331920ad3ac0",
+   "paper": "bd01331920ad3ac0",
+   "rows": 372
+  },
+  "DOPEUSDT": {
+   "replay": "eaa848f1d3e962e6",
+   "paper": "eaa848f1d3e962e6",
+   "rows": 372
+  },
+  "TORCHUSDT": {
+   "replay": "859a1d36ff0907c7",
+   "paper": "859a1d36ff0907c7",
+   "rows": 372
+  },
+  "MTOUSDT": {
+   "replay": "460b0559efc2627e",
+   "paper": "460b0559efc2627e",
+   "rows": 372
+  },
+  "MPLXUSDT": {
+   "replay": "94afbe448476ee21",
+   "paper": "94afbe448476ee21",
+   "rows": 372
+  },
+  "AXISUSDT": {
+   "replay": "98281e6a824b0d65",
+   "paper": "98281e6a824b0d65",
+   "rows": 372
+  },
+  "KIMCHIUSDT": {
+   "replay": "d165b86733c6459e",
+   "paper": "d165b86733c6459e",
+   "rows": 372
+  },
+  "RTUSDT": {
+   "replay": "ad2d7215735e4483",
+   "paper": "ad2d7215735e4483",
+   "rows": 372
+  },
+  "LALAUSDT": {
+   "replay": "19f6f9075d9bfe6f",
+   "paper": "9694f6f94d759eaa",
+   "rows": 372
+  },
+  "KAMIRAIUSDT": {
+   "replay": "111e0a4acc716d7e",
+   "paper": "3a3a02228ea66f59",
+   "rows": 372
+  },
+  "GANGUSDT": {
+   "replay": "9db907f6ae703147",
+   "paper": "a493e4863545daa1",
+   "rows": 372
+  },
+  "LAUNCHUSDT": {
+   "replay": "addc8d97978b8342",
+   "paper": "addc8d97978b8342",
+   "rows": 372
+  },
+  "RITUALUSDT": {
+   "replay": "eb14ce25a5e4a510",
+   "paper": "eb14ce25a5e4a510",
+   "rows": 372
+  },
+  "PRSMUSDT": {
+   "replay": "6c1dd985ac3b4604",
+   "paper": "6c1dd985ac3b4604",
+   "rows": 372
+  },
+  "RSGPUSDT": {
+   "replay": "c5276420172a4a2b",
+   "paper": "c5276420172a4a2b",
+   "rows": 372
+  },
+  "JAGENTUSDT": {
+   "replay": "89b8ae8e58b9f86e",
+   "paper": "89b8ae8e58b9f86e",
+   "rows": 372
+  },
+  "NOMAUSDT": {
+   "replay": "7514119791e99dad",
+   "paper": "7514119791e99dad",
+   "rows": 372
+  },
+  "VRAXUSDT": {
+   "replay": "299b1fc19b5407ea",
+   "paper": "299b1fc19b5407ea",
+   "rows": 372
+  },
+  "FOREVERUSDT": {
+   "replay": "3d372b88c5787f09",
+   "paper": "3d372b88c5787f09",
+   "rows": 372
+  },
+  "EMYAUSDT": {
+   "replay": "95742e9019b868fa",
+   "paper": "95742e9019b868fa",
+   "rows": 372
+  },
+  "ANAKINUSDT": {
+   "replay": "4a06f244a81f99cf",
+   "paper": "4a06f244a81f99cf",
+   "rows": 372
+  },
+  "KNTQUSDT": {
+   "replay": "1b7b7fa3204e01cf",
+   "paper": "1b7b7fa3204e01cf",
+   "rows": 372
+  },
+  "FLOATUSDT": {
+   "replay": "c6a7d892e450d3fb",
+   "paper": "c6a7d892e450d3fb",
+   "rows": 372
+  },
+  "KORUSDT": {
+   "replay": "dfc76b92ac32f64a",
+   "paper": "dfc76b92ac32f64a",
+   "rows": 372
+  },
+  "CHOOUSDT": {
+   "replay": "bbdeececbc7dd903",
+   "paper": "bbdeececbc7dd903",
+   "rows": 372
+  },
+  "ASTOCKUSDT": {
+   "replay": "02c08edee0adc0f3",
+   "paper": "02c08edee0adc0f3",
+   "rows": 372
+  },
+  "VLXUSDT": {
+   "replay": "a62c687359ccba91",
+   "paper": "c310dc9a921e804a",
+   "rows": 372
+  },
+  "牛逼USDT": {
+   "replay": "6d64c3ce948a42a4",
+   "paper": "6d64c3ce948a42a4",
+   "rows": 372
+  }
+ },
+ "cap": {
+  "HDLRUSDT": {
+   "cap": "a421cecf02bee3bf",
+   "rows": 114
+  },
+  "LALAUSDT": {
+   "cap": "0235026ac8963cf2",
+   "rows": 114
+  },
+  "NOMAUSDT": {
+   "cap": "cb6cad639a377488",
+   "rows": 114
+  },
+  "PRSMUSDT": {
+   "cap": "8653068fbb1449f8",
+   "rows": 114
+  },
+  "RTUSDT": {
+   "cap": "8517b798c792445a",
+   "rows": 114
+  }
+ },
+ "history": [
+  {
+   "at": "2026-11-11 13:50",
+   "code": "unknown (ModuleNotFoundError)",
+   "reason": "первый эталон: код e1a041a + исправление Book.snapshot (№ 3), проверено равенство с e1a041a: основная 11 904 строки, CAP 570 строк"
+  }
+ ]
+}

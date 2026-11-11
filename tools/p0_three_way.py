@@ -26,7 +26,7 @@ from pathlib import Path
 import paper_vs_replay as pvr
 from core.cap_breakout import MAIN_EARLY_PAPER, ORDER_USDT
 from core.feed import iter_lines
-from main_replay import LOGS
+from main_replay import LOGS, load_open
 
 WIN_FROM_MS, WIN_TO_MS, FIRST_MS = -5_000, 60_000, 2_000
 FIRST_VERSIONS = 15
@@ -206,6 +206,9 @@ def main() -> None:
     out.append(f"поправка часов: запись {rec_offset} мс, PAPER {p_off} мс (разница {p_off - rec_offset:+d} мс); "
                f"время кадра каждого процесса — в шкале биржи; «раньше/позже» — по локальным часам сервера")
 
+    st = log["start"] or {}
+    out.append(f"версии: код PAPER {st.get('code')}, предрегистрация {st.get('prereg')}, модель исполнения "
+               f"{st.get('exec_model')}, комиссии {st.get('fees')}, веток {st.get('sims')}; конфигурация — START_PAPER")
     out.append("\n## 1. Соединения")
     for t, ch, data in rec_ev:
         if ch.startswith("WS"):
@@ -215,11 +218,13 @@ def main() -> None:
             out.append(f"  PAPER {ch} T0{t - t0:+d} мс {data}")
 
     lo, hi = t0 + WIN_FROM_MS, t0 + WIN_TO_MS
+    missing: dict[str, dict] = {}
     out.append(f"\n## 2. Доступность событий (sendTime от T0{WIN_FROM_MS:+d} до T0+{WIN_TO_MS} мс)")
     for what in ("depth", "deals"):
         sets = {n: {k for k, (t, s) in getattr(c, what).items() if s and lo <= s <= hi} for n, c in conns.items()}
         union = set().union(*sets.values())
         miss = {n: len(union - s) for n, s in sets.items()}
+        missing[what] = miss
         label = "diff-ы стакана (toVersion)" if what == "depth" else "сделки (время, цена, кол-во)"
         out.append(f"  {label}: всего {len(union)}; нет на соединении: "
                    + ", ".join(f"{n} {m}" for n, m in miss.items()))
@@ -264,6 +269,12 @@ def main() -> None:
     for t, ch, d in jev:
         if ch in ("BOOK_VALID", "BOOK_INVALID") and t >= lo - 60_000:
             out.append(f"  {ch} T0{t - t0:+d} мс {d}")
+        elif ch in ("LOOP_LAG", "SLOW_FRAME") and t0 - FIRST_MS <= t <= t0 + FIRST_MS:
+            out.append(f"  {ch} T0{t - t0:+d} мс {d}")
+    first_proc = [(t - t0, d["ms"]) for t, ch, d in jev if ch == "PROC" and t0 <= t <= t0 + FIRST_MS]
+    out.append(f"  обработка кадров в первые {FIRST_MS} мс: {len(first_proc)} кадров, сумма "
+               f"{sum(m for _, m in first_proc):.1f} мс, дольше 5 мс: "
+               + (", ".join(f"T0{t:+d} — {m:.1f}" for t, m in first_proc if m > 5) or "нет"))
     summ = log["summary"] or {}
     lagd = summ.get("lag") or {}
     out.append(f"  SUMMARY: {json.dumps(lagd, ensure_ascii=False)}")
@@ -271,7 +282,7 @@ def main() -> None:
     out.append("\n## 5. Разложение до первого решения")
     cfg = Namespace(latency=[50], usdt=[ORDER_USDT], sweep=False, main_early=MAIN_EARLY_PAPER)
     times = summ.get("times") or {}
-    decs = sorted(log["decisions"], key=lambda e: e["decision_ms"])
+    decs = sorted((e for e in log["decisions"] if e.get("engine") == "main"), key=lambda e: e["decision_ms"])
     first_a = conns["A"].first_after_t0
     first_rel = f"{first_a[0] - t0:+d} мс" if first_a else "нет"
     out.append(f"  PAPER A: первый кадр после T0 {first_rel}; двусторонний стакан "
@@ -293,6 +304,25 @@ def main() -> None:
                             actual, t0)
     if rt0:
         out += compare_rows("REPLAY записи против фактического PAPER A (разные соединения)", rep_rec, actual, t0)
+    out.append(f"\n## 7. Состояния данных (sendTime T0{WIN_FROM_MS:+d} … T0+{WIN_TO_MS} мс, PAPER A)")
+    lost = missing.get("depth", {}).get("A", 0) + missing.get("deals", {}).get("A", 0)
+    gaps = [t for t, ch, d in jev if ch == "BOOK_INVALID" and lo <= t <= hi]
+    out.append(f"  DATA_CORRUPTED (потерянные события, разрывы версий стакана): событий нет на A {lost}, "
+               f"разрывов {len(gaps)}" + (f" ({', '.join(f'T0{t - t0:+d}' for t in gaps)})" if gaps else ""))
+    a_lags = [d for s_, d in conns["A"].delays if lo <= s_ <= hi]
+    base = min(a_lags) if a_lags else 0
+    over = {ms: sum(d - base > ms for d in a_lags) for ms in (300, 500, 800)}
+    out.append(f"  DELIVERY_DELAYED (получение − sendTime сверх минимума {base} мс): "
+               + ", ".join(f"> {ms} мс — {n}" for ms, n in over.items()) + f" из {len(a_lags)} кадров")
+    skips: dict[str, int] = {}
+    for r in actual:
+        for k, v in (r.get("skips") or {}).items():
+            skips[k] = skips.get(k, 0) + v
+    out.append(f"  DATA_STALE (отказы веток по актуальности стакана): stale_book {skips.get('stale_book', 0)}, "
+               f"book_invalid {skips.get('book_invalid', 0)}, momentum_not_ready {skips.get('momentum_not_ready', 0)}")
+    out.append(f"  MODEL_UNVERIFIED (время кадров восстановлено после остановки процесса): журнал A "
+               f"{(load_open(jr_path)[3] or {}).get('stalled_frames', 0)} кадров; запись "
+               f"{(load_open(rec_path)[3] or {}).get('stalled_frames', 0)} кадров")
     print("\n".join(out))
 
 
