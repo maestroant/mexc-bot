@@ -13,6 +13,7 @@ from collections import Counter
 from collections import defaultdict
 
 from core.cap_breakout import LOGS, PREREG_ID, no_entry_reason
+from core.data_marks import excluded, mark_line
 from main_replay import PROFILE_LABEL, evaluate
 
 GROUPS = [
@@ -74,6 +75,10 @@ def main() -> None:
     p.add_argument("--days", type=float, default=14, help="логи PAPER за N дней (14)")
     a = p.parse_args()
     items = summaries(a.days)
+    marked = [s for s in items if excluded(s["symbol"])]
+    items = [s for s in items if not excluded(s["symbol"])]  # решение клиента 13.11: вне основной выборки
+    for s in marked:
+        print(mark_line(s["symbol"]) + f"; лог PAPER сохранён ({len(engines(s).get('main') or [])} строк основной)")
     print(f"PAPER за {a.days:g} дн.: листингов {len(items)} (с потолком {sum(1 for s in items if s.get('cap'))})\n")
     for title, pick in GROUPS:
         rows = [r for s in items for eng in engines(s).values() for r in eng if pick(r)]

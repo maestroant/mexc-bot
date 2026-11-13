@@ -36,6 +36,7 @@ from pathlib import Path
 
 from core.cap_breakout import (HOLD_MARKS_S, KNOWN_CAPS, LOGS, MAIN_EARLY_GRID, ORDER_USDT, MainEngine, Opts,
                                find_cap, no_entry_reason)
+from core.data_marks import excluded, mark_line
 from core.feed import events_of, frame_meta, frame_time, iter_lines, line_t, ws_base_lag
 
 PROFILE_LABEL = {"MAIN_V21": "стандартный", "MAIN_NO_TIME_STOPS": "без врем. стопов", "MAIN_TP_TRAIL": "TP1+trailing",
@@ -43,7 +44,8 @@ PROFILE_LABEL = {"MAIN_V21": "стандартный", "MAIN_NO_TIME_STOPS": "б
                  "MAIN_TRAIL_ALL": "trailing всей поз."}
 RECON = "reconstructed"  # качество: интервал восстановлен по sendTime после остановки записи — не для выводов
 SKIP_SYMBOLS = {"PFPUSDT": "делистинг, не листинг", "PALUSDT": "листинг отменён"}
-GROUPS = {"no_cap": "Без потолка", "cap": "С потолком (замороженные)", "api": "API закрыт в начальном окне"}
+GROUPS = {"no_cap": "Без потолка", "cap": "С потолком (замороженные)", "api": "API закрыт в начальном окне",
+          "unconfirmed": "Доступность данных во времени не подтверждена (core/data_marks.py) — вне основной выборки"}
 
 
 def api_closed(symbol: str, within_ms: int = 30_000) -> bool:
@@ -140,6 +142,8 @@ def run_listing(path: Path, args) -> tuple[list[dict], dict]:
         meta.update(status="SKIP_API_CLOSED", group="api")
         return [], meta
     meta.update(status="ok", group="cap" if cap else "no_cap")
+    if excluded(symbol):  # решение клиента 13.11: считается и показывается отдельно, в итоги групп не входит
+        meta.update(group="unconfirmed", mark=mark_line(symbol))
     opts = Opts(fee=(args.fee or 0.08) / 100, fee_from_info=args.fee is None)
     engine = MainEngine(args, opts, open_ms, info, cap[0] if cap else None)
     for t, kind, data, recv, exch in events:

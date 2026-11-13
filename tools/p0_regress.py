@@ -7,7 +7,10 @@
   2. неизменность результатов: строки основной стратегии (путь REPLAY и путь PAPER, набор PAPER) по каждой записи
      совпадают с эталоном tools/regress_golden.json (сравнивается отпечаток строк);
   3. то же для CAP BREAKOUT (tools/cap_replay.py --all-frozen) по полным записям замороженных листингов, если задана
-     папка --cap-dir (в ней rec_*.jsonl.gz и probe_*.jsonl со строками 30010).
+     папка --cap-dir (в ней rec_*.jsonl.gz и probe_*.jsonl со строками 30010);
+  4. причинность CAP BREAKOUT (решение клиента 11.11) на тех же записях: снятие потолка — не раньше обработки первой
+     сделки выше потолка; обрыв потока на любом из моментов около неё и снятия не меняет того, что уже решено
+     (prefix invariance); путь PAPER (движок создан на T0 + 1 с, как после обнаружения 30010 пробой) = REPLAY.
 Запись, которой нет в эталоне, — предупреждение, не ошибка. Код выхода 1 — что-то не совпало.
   python3 tools/p0_regress.py extract --src logs --dst logs/p0win
   python3 tools/p0_regress.py check --win logs/p0win --cap-dir logs
@@ -121,6 +124,90 @@ def cap_rows(cap_dir: Path) -> dict:
             for s, rs in sorted(by.items())}
 
 
+CAP_KEYS = ("decision_ms", "entry_ms", "entry_px", "reason", "pnl_usdt", "exit_ms")
+
+
+def cap_causal(cap_dir: Path) -> tuple[list[str], list[str]]:
+    """Причинность CAP BREAKOUT на полных записях папки: (ошибки, строки отчёта)."""
+    from argparse import Namespace
+
+    import cap_replay
+    import core.cap_breakout as cb
+    from core.cap_breakout import EARLY_USDT, ORDER_USDT, CapEngine, Opts
+    for mod in (cb, cap_replay):
+        mod.LOGS = cap_dir
+    cfg = Namespace(modes=["FAST", "CONFIRMED", "EARLY"], early={}, early_sweep=False, latency=[50],
+                    usdt=[ORDER_USDT], early_usdt=list(EARLY_USDT))  # как PAPER
+    errors, lines = [], []
+    for path in cap_replay.frozen_records():
+        sym = path.name.split("_")[1]
+        found = cb.find_cap(sym) or ((cb.KNOWN_CAPS[sym], "") if sym in cb.KNOWN_CAPS else None)
+        if not found:
+            continue
+        cap = found[0]
+        idx: dict = {}
+        snaps: dict = {}  # момент обрыва → состояние веток после последнего события не позже него
+        cuts: list = []
+
+        def sim_state(eng):
+            return [(x.state, x.result.get("decision_ms"), x.result.get("entry_ms"), x.result.get("entry_px"),
+                     x.buy_misses, round(x.Q, 12), x.tp_fills) for x in eng.sims]
+
+        def mark(i, t, kind, eng):
+            if eng.cand_ms is not None and "cand" not in idx:
+                idx["cand"] = (i, t, kind)
+            if eng.release is not None and "release" not in idx:
+                idx["release"] = (i, t, kind)
+            for cut in cuts:
+                if t <= cut:
+                    snaps[cut] = (eng.release, sim_state(eng))
+
+        full, t0 = cap_replay.run_causal(path, cfg, Opts(), cap, on_event=mark)
+        if full is None or full.release is None:
+            lines.append(f"  {sym}: снятия нет — проверки причинности не нужны")
+            continue
+        bad = []
+        c, r = idx["cand"], idx["release"]
+        if not (r[0] >= c[0] and r[1] >= c[1] and c[2] == "deal"):
+            bad.append(f"снятие (событие {r[0]}, {r[2]}) раньше первой сделки выше потолка (событие {c[0]})")
+        cuts[:] = [c[1] - 1000, c[1], r[1], r[1] + 1000, r[1] + 5000, r[1] + 30_000]
+        snaps.clear()
+        cap_replay.run_causal(path, cfg, Opts(), cap, on_event=mark)  # второй проход — снимки на моментах обрыва
+        for cut in cuts:
+            part, _ = cap_replay.run_causal(path, cfg, Opts(), cap, cut_ms=cut)
+            if snaps.get(cut) != (part.release, sim_state(part)):
+                bad.append(f"обрыв на T0{cut - t0:+d}: состояние веток отличается от полного прогона на тот же момент")
+        # путь PAPER: движок создаётся на T0 + 1 с (после 30010 пробы), дальше тот же поток
+        eng = CapEngine(cfg, Opts(), cap, t0, {})
+        for item in cap_replay.stream(path, t0):
+            if item[0] == "info":
+                if eng.release is None:
+                    eng.info = item[2]
+                continue
+            t, kind, data = item
+            if t < t0 + 1000:
+                continue
+            if (eng.release is not None and t > eng.release + cap_replay.CAP_AFTER_MS) or (
+                    eng.release is None and t > t0 + cap_replay.RELEASE_WAIT_MS):
+                break
+            eng.on_event(t, kind, data)
+            last = t
+        if eng.release is not None:
+            eng.finish(min(eng.release + cap_replay.CAP_AFTER_MS, last))
+        rows_p = {(x["mode"], x["variant"], x["profile"], x["usdt"]): tuple(x.get(k) for k in CAP_KEYS)
+                  for x in eng.rows(sym)}
+        rows_r = {(x["mode"], x["variant"], x["profile"], x["usdt"]): tuple(x.get(k) for k in CAP_KEYS)
+                  for x in full.rows(sym)}
+        diff = sum(rows_p.get(k) != rows_r.get(k) for k in set(rows_p) | set(rows_r))
+        if diff:
+            bad.append(f"путь PAPER против REPLAY: расхождений {diff} из {len(rows_r)}")
+        lines.append(f"  {sym}: первая сделка выше потолка T0{c[1] - t0:+d} мс (событие {c[0]}), снятие T0"
+                     f"{r[1] - t0:+d} мс (событие {r[0]}, {r[2]}); обрывов {len(cuts)}; PAPER = REPLAY: "
+                     f"{len(rows_r) - diff}/{len(rows_r)}" + (f"; ОШИБКИ: {bad[:3]}" if bad else ""))
+        errors += [f"CAP {sym}: {b}" for b in bad]
+    return errors, lines
+
+
 def stress(win: Path) -> list[str]:
     """Все тесты p0_stress по всем окнам; список непрошедших «запись: тест»."""
     import p0_stress as ps
@@ -141,8 +228,8 @@ def compare(name: str, now: dict, gold: dict) -> tuple[list[str], list[str]]:
         elif {k: v[k] for k in v if k != "rows"} != {k: g[k] for k in g if k != "rows"}:
             errors.append(f"{name} {sym}: строки изменились ({g.get('rows')} → {v.get('rows')} строк)")
     for sym in gold:
-        if sym not in now:
-            warnings.append(f"{name} {sym}: есть в эталоне, нет в данных")
+        if sym not in now:  # 13.11: проверка без данных — не «пройдена» (раньше было предупреждение)
+            errors.append(f"{name} {sym}: есть в эталоне, нет в данных — проверьте --win / --cap-dir")
     return errors, warnings
 
 
@@ -172,6 +259,8 @@ def main() -> None:
     win = Path(a.win)
     main_now = main_rows(win)
     cap_now = cap_rows(Path(a.cap_dir)) if a.cap_dir else {}
+    if a.action == "check" and not a.cap_dir:
+        raise SystemExit("check: нужна --cap-dir (причинность и эталон CAP BREAKOUT обязательны, решение клиента 12.11)")
     golden = Path(a.golden)
     if a.action == "save":
         if not a.reason:
@@ -190,6 +279,11 @@ def main() -> None:
     if not a.skip_stress:
         print("контролируемые тесты p0_stress:")
         errors += [f"тест не прошёл — {x}" for x in stress(win)]
+    if a.cap_dir:
+        print("причинность CAP BREAKOUT:")
+        e, lines = cap_causal(Path(a.cap_dir))
+        print("\n".join(lines))
+        errors += e
     for w in warnings:
         print(f"предупреждение: {w}")
     for e in errors:

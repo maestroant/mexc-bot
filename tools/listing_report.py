@@ -19,7 +19,11 @@ T0 — момент открытия, который определил реко
 import argparse
 import gzip
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import core.data_marks as DM  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 LOGS = ROOT / "logs"
@@ -213,7 +217,8 @@ def main() -> None:
         spreads = "/".join(fmt(r.get(f"spread_{s}s_pct")) for s in BOOK_AT_S)
         prices = " / ".join(fmt(r.get(f"chg_{m}m_pct"), "%") for m in PRICE_AT_MIN)
         vols = " / ".join(f"{r.get(f'vol_{m}m_usdt', 0):,}".replace(",", " ") for m in VOLUME_AT_MIN)
-        print(f"| {r['symbol']} | {', '.join(r.get('zones') or [])} | {fmt(r.get('api_first_ok_s'))} | {r.get('api_10007', '—')} "
+        mark = f" ({DM.MARKS[r['symbol']]['mark']})" if r["symbol"] in DM.MARKS else ""
+        print(f"| {r['symbol']}{mark} | {', '.join(r.get('zones') or [])} | {fmt(r.get('api_first_ok_s'))} | {r.get('api_10007', '—')} "
               f"| {fmt(r.get('first_deal_s'))} | {spreads} | {fmt(r.get('spread_ok_first_s'))} / {r.get('spread_ok_share_1m')}% "
               f"| {fmt(r.get('depth2_5s_usdt'))} | {prices} | {fmt(r.get('max_pct'), '%')} ({r.get('max_at_s')}) / {fmt(r.get('min_pct'), '%')} "
               f"| {vols} |")

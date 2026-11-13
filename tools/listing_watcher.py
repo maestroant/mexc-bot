@@ -92,6 +92,8 @@ class Watcher:
                    ["--duration", str(a.duration), "--max-wait", str(a.max_wait)])
         if a.paper:
             self.spawn("paper", "paper.py", symbol, ["--max-wait", str(a.max_wait)])
+            # профиль CPU/планировщика вокруг T0 — отдельный процесс, цикл PAPER не трогает (решение клиента 13.11, п. 6)
+            self.spawn("sched", "sched_sampler.py", symbol, ["--max-wait", str(a.max_wait)])
         self.state["handled"][symbol] = {"ts": now_ms(), "status": info.get("status"),
                                          "firstOpenTime": info.get("firstOpenTime"), "zones": info.get("conceptPlates"),
                                          "replay": "pending"}

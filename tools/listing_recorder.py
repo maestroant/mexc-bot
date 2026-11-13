@@ -6,7 +6,11 @@
   src=ws_priv  приватные WS-потоки нашего аккаунта (ордера, сделки, баланс), если есть ключи
   src=rest     снимки REST: exchangeInfo, стакан 1000 уровней, последние сделки, тикеры
   src=event    служебные события: подключения, подписки, OPEN_DETECTED, ошибки
-Поле t — локальное время получения (ms, с поправкой на часы биржи), у WS есть и время биржи внутри data.
+Поле t — локальное время получения (ms, с поправкой на часы биржи), у WS есть и время биржи внутри data;
+поле m (в конце строки) — локальное монотонное время сервера, мс (для WS — до разбора кадра): по нему сравниваются процессы
+на одном сервере. Поправка часов — core/clock.py, то же правило, что у PAPER (P0, клиент 11.11): лучший по RTT из 5
+запросов на тёплом соединении, пересчёт раз в 10 мин, заморозка за 5 мин до firstOpenTime; каждое применение — событие
+CLOCK (поправка, RTT, выборка, момент применения).
 
 До открытия пары (status != 1) REST опрашивается раз в --pre-interval секунд, после — раз в --interval.
 Открытие (T=0) — первая сделка или первый двусторонний bookTicker.
@@ -35,6 +39,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE / "mexc_pb"))
 from PushDataV3ApiWrapper_pb2 import PushDataV3ApiWrapper  # noqa: E402
 
+from core.clock import Clock, measure, mono_ms  # noqa: E402
 from notify import notify  # noqa: E402
 from probe_listing import ROOT, Client, load_dotenv, now_ms  # noqa: E402
 
@@ -76,12 +81,13 @@ class Recorder:
         self.path = log_dir / f"rec_{self.sym}_{datetime.now():%Y%m%d_%H%M%S}.jsonl.gz"
         self.out = gzip.open(self.path, "at", encoding="utf-8", compresslevel=5)
         self.last_flush = time.monotonic()
+        self.clock = Clock(client, self.event)
 
     def t(self) -> int:
         return now_ms() + self.client.time_offset_ms
 
-    def write(self, src: str, ch: str, data, **extra) -> None:
-        entry = {"t": self.t(), "src": src, "ch": ch, "data": data, **extra}
+    def write(self, src: str, ch: str, data, m: float | None = None, **extra) -> None:
+        entry = {"t": self.t(), "src": src, "ch": ch, "data": data, **extra, "m": mono_ms() if m is None else m}
         self.out.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
         key = f"{src}:{ch.split('@')[1]}" if "@" in ch else f"{src}:{ch}"
         self.counts[key] = self.counts.get(key, 0) + 1
@@ -105,16 +111,16 @@ class Recorder:
 
     # --- WebSocket ------------------------------------------------------------
 
-    def handle_frame(self, src: str, frame) -> None:
+    def handle_frame(self, src: str, frame, m: float | None = None) -> None:
         if isinstance(frame, bytes):
             try:
                 msg = PushDataV3ApiWrapper.FromString(frame)
                 data = MessageToDict(msg, preserving_proto_field_name=True)
             except Exception as e:
-                self.write(src, "undecoded", base64.b64encode(frame).decode(), error=str(e))
+                self.write(src, "undecoded", base64.b64encode(frame).decode(), m=m, error=str(e))
                 return
             ch = data.get("channel", "?")
-            self.write(src, ch, data)
+            self.write(src, ch, data, m=m)
             if src == "ws_pub" and self.open_ms is None:
                 deals = data.get("publicAggreDeals", {}).get("deals")
                 bt = data.get("publicAggreBookTicker", {})
@@ -146,7 +152,7 @@ class Recorder:
                                 frame = await asyncio.wait_for(ws.recv(), timeout=1)
                             except asyncio.TimeoutError:
                                 continue
-                            self.handle_frame(src, frame)
+                            self.handle_frame(src, frame, mono_ms())
                     finally:
                         pinger.cancel()
             except Exception as e:
@@ -241,6 +247,7 @@ class Recorder:
             asyncio.create_task(self.ws_loop("ws_pub", WS_URL, public_channels(self.sym))),
             asyncio.create_task(self.rest_loop()),
             asyncio.create_task(self.watchdog()),
+            asyncio.create_task(self.clock.loop(self.stop, lambda: self.first_open_ms, self.t)),
         ]
         if self.client.has_keys:
             tasks.append(asyncio.create_task(self.private_loop()))
@@ -269,7 +276,11 @@ def main() -> None:
 
     load_dotenv(ROOT / ".env")
     client = Client(os.environ.get("MEXC_API_KEY"), os.environ.get("MEXC_API_SECRET"), 10.0)
-    client.sync_time()
+    res = measure()  # то же правило, что у PAPER (core/clock.py); раньше — один холодный запрос
+    if res:
+        client.time_offset_ms = res["offset_ms"]
+    else:
+        client.sync_time()
     asyncio.run(Recorder(args, client).run())
 
 

@@ -58,6 +58,9 @@ def key(r: dict) -> tuple:
 
 
 def compare(path: Path, cfg) -> tuple[int, int]:
+    from core.data_marks import mark_line
+    if (ml := mark_line(path.name.split("_")[1])):
+        print(ml)
     t0, rep = replay_path(path, cfg)
     if t0 is None:
         print(f"{path.name}: открытия нет")

@@ -53,6 +53,13 @@ def record_for(sym: str, stamp: str) -> Path | None:
 
 def main() -> None:
     load_dotenv(ROOT / ".env")
+    try:  # контроль работоспособности супервизора восстановления проб (решение клиента 12.11 вечер, C-04)
+        import probe_risk
+        stale = probe_risk.supervisor_stale()
+        if stale:
+            print(stale, flush=True)
+    except Exception as e:  # noqa: BLE001 — разбор листингов не должен падать из-за проверки
+        print(f"проверка супервизора: {type(e).__name__}: {e}", flush=True)
     now = datetime.now(timezone.utc)
     soon = listing_soon(now)
     for journal in sorted(LOGS.glob("paperrec_*_2*.jsonl.gz")):

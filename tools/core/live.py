@@ -4,12 +4,14 @@ WebSocket: сделки и diff-стакан aggre 10ms (protobuf); REST: exchan
 снимок стакана 1000 уровней раз в snapshot_s секунд (из него и diff-ов строится локальный стакан, как в записи).
 Каждый кадр уходит в on_entry({"t", "src", "ch", "conn", "data"}) сразу по приходу; t — локальное время с поправкой
 на часы биржи. Диагностика (P0): теневое WS-соединение B с теми же подписками — его кадры идут в on_shadow и в стратегию
-не попадают (сравнение доставки двух соединений по одним часам); при подключении — адрес шлюза; поправка часов
-пересчитывается каждые clock_s секунд по лучшему из 5 запросов /api/v3/time и замораживается за 5 мин до открытия.
+не попадают (сравнение доставки двух соединений по одним часам); при подключении — адрес шлюза; поправка часов —
+core/clock.py (одно правило с записью: пересчёт каждые clock_s секунд, заморозка за 5 мин до открытия). У каждого кадра
+m — локальное монотонное время получения (до разбора protobuf), у WS-кадров ещё parse_ms — время разбора (P0, 11.11).
 Нужны websockets, protobuf и скомпилированные tools/mexc_pb (как у listing_recorder)."""
 
 import asyncio
 import json
+import ssl
 import sys
 import time
 from pathlib import Path
@@ -20,23 +22,42 @@ from google.protobuf.json_format import MessageToDict
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mexc_pb"))
 from PushDataV3ApiWrapper_pb2 import PushDataV3ApiWrapper  # noqa: E402
 
+from core.clock import CLOCK_S, Clock, mono_ms  # noqa: E402
+
 WS_URL = "wss://wbs-api.mexc.com/ws"
+SSL_CONTEXT_REUSE = True
+
+
+def queued(ws) -> int | None:
+    """Кадров в очереди websockets, уже принятых, но ещё не прочитанных (websockets ≥ 13, asyncio-реализация);
+    байты в буфере сокета ядра сюда не входят. None — версия библиотеки не даёт этого счётчика."""
+    try:
+        return len(ws.recv_messages.frames)
+    except (AttributeError, TypeError):
+        return None
 
 
 class LiveFeed:
     def __init__(self, symbol: str, client, on_entry, on_log=print, snapshot_s: float = 1.0, info_s: float = 10.0,
-                 on_shadow=None, on_event=None, clock_s: float = 600.0):
+                 on_shadow=None, on_event=None, clock_s: float = CLOCK_S):
         self.sym, self.client, self.on_entry, self.log = symbol, client, on_entry, on_log
         self.on_shadow, self.on_event = on_shadow, on_event or (lambda name, **data: None)
         self.snapshot_s, self.info_s, self.clock_s = snapshot_s, info_s, clock_s
         self.online = False  # status == 1 в exchangeInfo
         self.first_open: int | None = None  # firstOpenTime из exchangeInfo
+        self.clock = Clock(client, self.on_event)
+        # шаг 1 оптимизаций (клиент 12.11): SSL-контекст создаётся один раз при запуске и переиспользуется при каждом
+        # подключении и переподключении WS (раньше websockets создавал новый на каждое: ~27 мс блокировки цикла,
+        # 140–240 мс при старте вместе с HTTPS в другом потоке). Проверка сертификатов та же (системные CA на момент
+        # запуска процесса); правила переподключения не меняются. Откат: SSL_CONTEXT_REUSE = False.
+        self.ssl_ctx = ssl.create_default_context() if SSL_CONTEXT_REUSE else None
 
     def t(self) -> int:
         return int(time.time() * 1000) + self.client.time_offset_ms
 
-    def emit(self, src: str, ch: str, data, conn: str = "A", **extra) -> None:
-        entry = {"t": self.t(), "src": src, "ch": ch, "conn": conn, "data": data, **extra}
+    def emit(self, src: str, ch: str, data, conn: str = "A", m: float | None = None, **extra) -> None:
+        entry = {"t": self.t(), "src": src, "ch": ch, "conn": conn, "data": data, **extra,
+                 "m": mono_ms() if m is None else m}
         (self.on_entry if conn == "A" else self.on_shadow)(entry)
 
     async def run(self, stop: asyncio.Event) -> None:
@@ -54,7 +75,8 @@ class LiveFeed:
                     f"spot@public.aggre.depth.v3.api.pb@10ms@{self.sym}"]
         while not stop.is_set():
             try:
-                async with websockets.connect(WS_URL, ping_interval=None, max_size=None, open_timeout=15) as ws:
+                tls = {"ssl": self.ssl_ctx} if self.ssl_ctx is not None else {}
+                async with websockets.connect(WS_URL, ping_interval=None, max_size=None, open_timeout=15, **tls) as ws:
                     self.log(f"WS {conn} подключён ({ws.remote_address}): {', '.join(channels)}")
                     self.on_event("WS_CONNECTED", conn=conn, remote=str(ws.remote_address))
                     await ws.send(json.dumps({"method": "SUBSCRIPTION", "params": channels}))
@@ -66,9 +88,12 @@ class LiveFeed:
                             except asyncio.TimeoutError:
                                 continue
                             if isinstance(frame, bytes):
+                                m = mono_ms()
+                                q = queued(ws)
                                 data = MessageToDict(PushDataV3ApiWrapper.FromString(frame),
                                                      preserving_proto_field_name=True)
-                                self.emit("ws_pub", data.get("channel", "?"), data, conn)
+                                self.emit("ws_pub", data.get("channel", "?"), data, conn, m=m,
+                                          parse_ms=round(mono_ms() - m, 3), q=q)
                     finally:
                         pinger.cancel()
             except Exception as e:  # обрыв — переподключение; стакан станет действительным со следующим снимком
@@ -108,18 +133,4 @@ class LiveFeed:
             await asyncio.sleep(max(0.0, interval - (time.monotonic() - started)))
 
     async def clock_loop(self, stop: asyncio.Event) -> None:
-        """Поправка часов к бирже: лучший по задержке из 5 запросов /api/v3/time, раз в clock_s секунд; за 5 мин до
-        открытия и позже не меняется, чтобы время кадров на открытии было в одной шкале."""
-        while not stop.is_set():
-            if self.first_open is None or self.t() < self.first_open - 300_000:
-                best = None
-                for _ in range(5):
-                    r = await asyncio.to_thread(self.client.call, "GET", "/api/v3/time")
-                    local = int(time.time() * 1000)
-                    if r.ok and (best is None or r.latency_ms < best[1]):
-                        best = (r.body["serverTime"] - local + int(r.latency_ms / 2), r.latency_ms)
-                if best:
-                    old = self.client.time_offset_ms
-                    self.client.time_offset_ms = best[0]
-                    self.on_event("CLOCK", offset_ms=best[0], change_ms=best[0] - old, rtt_ms=round(best[1], 1))
-            await asyncio.sleep(self.clock_s)
+        await self.clock.loop(stop, lambda: self.first_open, self.t, self.clock_s)

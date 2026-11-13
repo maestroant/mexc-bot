@@ -62,41 +62,71 @@ def frozen_records() -> list[Path]:
     return sorted(found, key=lambda p: p.name.split("_", 2)[2])
 
 
-def load(path: Path, cap: float, before_ms=30_000, after_ms=170_000):
-    """Два прохода: найти снятие потолка по сделкам, затем взять все события стакана и сделки вокруг него."""
-    open_ms, cand_ms = None, None
+CAP_AFTER_MS = 170_000  # ветки ведутся до снятия + 170 с — как PAPER --after-release
+RELEASE_WAIT_MS = 30 * 60_000  # снятия ждём до T0 + 30 мин — как PAPER --release-wait
+
+
+def open_time(path: Path) -> int | None:
+    """T0 по единой модели ядра (как MainEngine в PAPER): firstOpenTime из exchangeInfo, полученного до открытия,
+    иначе OPEN_DETECTED записи."""
+    first_open = None
     for line in iter_lines(path):
-        if open_ms is None:
-            if '"OPEN_DETECTED"' in line:
-                e = json.loads(line)
-                open_ms = e["data"].get("open_ms") or e["t"]
-            continue
-        if '"publicAggreDeals"' in line and line_t(line) > open_ms + 60_000:  # не текст подписки и не COUNTS
+        if '"ch":"exchangeInfo"' in line and '"firstOpenTime"' in line:
+            syms = (json.loads(line)["data"] or {}).get("symbols") or []
+            if syms and syms[0].get("firstOpenTime"):
+                first_open = int(syms[0]["firstOpenTime"])
+        elif '"OPEN_DETECTED"' in line:
             e = json.loads(line)
-            if any(float(d["price"]) > cap * 1.000001 for d in e["data"]["publicAggreDeals"].get("deals", [])):
-                cand_ms = e["t"]
-                break
-    if cand_ms is None:
-        return open_ms, None, [], {}
-    lo, hi = cand_ms - before_ms, cand_ms + after_ms
-    events, info = [], {}
+            return first_open or e["data"].get("open_ms") or e["t"]
+    return first_open
+
+
+def stream(path: Path, open_ms: int):
+    """Поток записи (или журнала PAPER A) в порядке получения, как его видел бы PAPER: ("info", t, exchangeInfo)
+    и события движка (t, kind, data) начиная с T0. Без сортировки и без знания будущего."""
     for line in iter_lines(path):
-        t = line_t(line)
-        if t < lo - 60_000:
-            continue
-        if t > hi:
-            break
         if '"ch":"exchangeInfo"' in line:
             syms = (json.loads(line)["data"] or {}).get("symbols") or []
             if syms:
-                info = syms[0]
-        elif t < lo:
+                yield "info", line_t(line), syms[0]
             continue
-        elif ('"src":"rest","ch":"depth"' in line or '"publicAggreDepths"' in line
-              or '"publicAggreDeals"' in line):
-            events += events_of(json.loads(line))
-    events.sort(key=lambda e: e[0])
-    return open_ms, cand_ms, events, info
+        if line_t(line) < open_ms:
+            continue
+        if ('"src":"rest","ch":"depth"' in line or '"publicAggreDepths"' in line
+                or '"publicAggreDeals"' in line):
+            yield from events_of(json.loads(line))
+
+
+def run_causal(path: Path, cfg, opts: Opts, cap: float, cut_ms: int | None = None, on_event=None):
+    """CAP BREAKOUT REPLAY без заглядывания в будущее (решение клиента 11.11): движок с T0, первая сделка выше
+    потолка и снятие находятся по потоку в порядке получения — как в PAPER; exchangeInfo применяется, пока потолок
+    не снят; ветки — до снятия + CAP_AFTER_MS, без снятия — до T0 + RELEASE_WAIT_MS. cut_ms — оборвать поток на
+    этом времени без завершения веток (проверка независимости от будущего); on_event(i, t, kind, engine) — после
+    каждого события. Возвращает (движок, T0)."""
+    open_ms = open_time(path)
+    if open_ms is None:
+        return None, None
+    eng = CapEngine(cfg, opts, cap, open_ms, {})
+    last, i = None, 0
+    for item in stream(path, open_ms):
+        if item[0] == "info":
+            if eng.release is None:
+                eng.info = item[2]
+            continue
+        t, kind, data = item
+        if cut_ms is not None and t > cut_ms:
+            return eng, open_ms
+        if eng.release is not None and t > eng.release + CAP_AFTER_MS:
+            break
+        if eng.release is None and t > open_ms + RELEASE_WAIT_MS:
+            break
+        eng.on_event(t, kind, data)
+        if on_event:
+            on_event(i, t, kind, eng)
+        last, i = t, i + 1
+    if eng.release is not None and cut_ms is None:
+        eng.finish(min(eng.release + CAP_AFTER_MS, last))
+    return eng, open_ms
 
 
 # --- прогон -------------------------------------------------------------------
@@ -114,19 +144,16 @@ def run_listing(path: Path, args, caps: dict) -> tuple[list[dict], dict]:
         return [], meta
     cap, src = cap_src
     meta.update(status="not_released", cap=cap, src=src)
-    open_ms, cand_ms, events, info = load(path, cap)
-    if not events:
-        if not args.summary_only:
-            print(f"{symbol}: потолок {cap}, но сделок выше него в записи не было — пропуск")
-        return [], meta
-    step, qty_step, _, zones = market_params(info)
     opts = Opts(args.stops_basis == "stressed", args.depth_band / 100, args.depth_persist_ms, args.entry_stress,
                 args.entry_basis, args.pre_buy_drop, (args.fee or 100 * TAKER_FEE) / 100, args.fee_in_coin,
                 fee_from_info=args.fee is None)
-    engine = CapEngine(args, opts, cap, open_ms, info, cand_ms)
-    for t, kind, data in events:
-        engine.on_event(t, kind, data)
-    engine.finish(events[-1][0])
+    engine, open_ms = run_causal(path, args, opts, cap)
+    if engine is None or engine.cand_ms is None:
+        if not args.summary_only:
+            print(f"{symbol}: потолок {cap}, но сделок выше него в записи не было — пропуск")
+        return [], meta
+    cand_ms = engine.cand_ms
+    step, qty_step, _, zones = market_params(engine.info)
     release, book, sims = engine.release, engine.book, engine.sims
     rows = engine.rows(symbol)
     meta.update(zones=zones, open_ms=open_ms, release_ms=release, status="released" if release else "not_released")
@@ -437,7 +464,10 @@ def main() -> None:
     if texts:
         print("\n\n".join(texts))
     else:
-        summary(rows)
+        from core.data_marks import excluded, mark_line
+        for sym in sorted({r["symbol"] for r in rows if excluded(r["symbol"])}):
+            print(mark_line(sym))  # строки остаются в --json и в регрессии; в итог не входят
+        summary([r for r in rows if not excluded(r["symbol"])])
     print(f"\n({len(files)} записей, {time.monotonic() - started:.0f} с)", file=sys.stderr)
     if args.json:
         Path(args.json).write_text(json.dumps(rows, ensure_ascii=False, indent=1, default=str), encoding="utf-8")

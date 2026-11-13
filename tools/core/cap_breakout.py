@@ -7,6 +7,7 @@ from collections import deque
 from itertools import product
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from time import perf_counter
 
 from .book import Book, ceil_step, depth_usdt, floor_step, vwap
 
@@ -794,16 +795,26 @@ class CapEngine:
 
     События (t, kind, data): snap — REST-снимок стакана, diff — aggre.depth, deal — (цена, кол-во, сторона).
     Снятие потолка: первая сделка выше потолка позже T+60 с (cand), затем bid локального стакана выше потолка.
-    В момент снятия создаются ветки (make_sims); дальше каждое событие проходит через все ветки."""
+    В момент снятия создаются ветки (make_sims); дальше каждое событие проходит через все ветки.
+    Первую сделку выше потолка движок находит только сам, по уже обработанным событиям — и в PAPER, и в REPLAY
+    (до 11.11 REPLAY передавал её время заранее и мог «снять» потолок на diff, пришедшем раньше этой сделки)."""
 
     def __init__(self, cfg, opts: Opts, cap: float, open_ms: int, info: dict, cand_ms: int | None = None):
+        if cand_ms is not None and type(self) is CapEngine:
+            raise ValueError("CapEngine: время первой сделки выше потолка нельзя передавать заранее — "
+                             "это знание будущего (решение клиента 11.11)")
         self.cfg, self.opts, self.cap, self.open_ms = cfg, opts, cap, open_ms
         self.info = info
-        self.cand_ms = cand_ms  # REPLAY знает его заранее; PAPER находит по потоку
+        self.cand_ms = cand_ms  # CAP — только по потоку; MainEngine хранит здесь T0
         self.book = Book()
         self.release: int | None = None
         self.sims: list[Sim] = []
         self.last_t = 0
+        # диагностика PAPER (P0, 11.11–12.11): время обновления стакана, запуска веток и веток BASELINE (ТЗ v2.1:
+        # MAIN, base, MAIN_V21), с; порядок обработки веток не меняется, на решения не влияет
+        self.book_s = self.start_s = self.base_s = 0.0
+        self._base_ids: set = set()
+        self._base_n = -1
 
     def on_event(self, t: int, kind: str, data, recv_t: int | None = None, exch_t: int | None = None) -> None:
         """recv_t — время получения кадра (localReceiveTime), exch_t — время биржи (sendTime кадра); t — время модели
@@ -811,22 +822,44 @@ class CapEngine:
         self.last_t = t
         book = self.book
         book.recv_t, book.exch_t = recv_t, exch_t
+        if self._base_n != len(self.sims):
+            self._base_ids = {id(x) for x in self.sims if x.mode == "MAIN" and x.variant == "base"
+                              and x.profile.name == "MAIN_V21"}
+            self._base_n = len(self.sims)
+        base_ids = self._base_ids
         for s in self.sims:
             if s.state != "DONE":
-                s.before_event(t, book)
+                if id(s) in base_ids:
+                    b0 = perf_counter()
+                    s.before_event(t, book)
+                    self.base_s += perf_counter() - b0
+                else:
+                    s.before_event(t, book)
         before = book.updates
+        p0 = perf_counter()
         if kind == "snap":
             book.snapshot(data)
         elif kind == "diff":
             book.diff(data)
         book.stamp(t, before)
+        p1 = perf_counter()
+        self.book_s += p1 - p0
         if self.release is None:
             self.try_start(t, kind, data)
+            self.start_s += perf_counter() - p1
+        if self._base_n != len(self.sims):  # ветки только что созданы (снятие потолка / старт)
+            self._base_ids = {id(x) for x in self.sims if x.mode == "MAIN" and x.variant == "base"
+                              and x.profile.name == "MAIN_V21"}
+            self._base_n = len(self.sims)
+        base_ids = self._base_ids
         for s in self.sims:
+            b0 = perf_counter() if id(s) in base_ids else None
             if s.state != "DONE":
                 s.after_event(t, kind, book, data if kind == "deal" else None)
             if s.entry_ms and kind != "deal" and book.valid and len(s.marks) < len(HOLD_MARKS_S):
                 s.mark(t, book)
+            if b0 is not None:
+                self.base_s += perf_counter() - b0
 
     def try_start(self, t: int, kind: str, data) -> None:
         """Снятие потолка: первая сделка выше него позже T+60 с, затем bid локального стакана выше потолка."""

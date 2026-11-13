@@ -13,7 +13,14 @@ B — метаданные: sendTime, версии diff-ов, сделки), л�
   5. разложение до первого решения: T0 → первый кадр после T0 (доставка) → действительный двусторонний стакан
      (ожидание стакана) → первое решение; по PAPER A и по REPLAY записи;
   6. REPLAY на журнале PAPER A против фактических решений PAPER A (SUMMARY), путь PAPER на том же журнале, и REPLAY
-     записи против PAPER A — масштаб расхождения между соединениями.
+     записи против PAPER A — масштаб расхождения между соединениями;
+  7. четыре состояния данных (DATA_CORRUPTED, DATA_STALE, DELIVERY_DELAYED, MODEL_UNVERIFIED);
+  8. CAP BREAKOUT (если был потолок): вехи (движок, первая сделка выше потолка, снятие, стакан, решения, входы, TP,
+     выходы, конец окна журнала), путь PAPER и REPLAY (причинный, cap_replay.run_causal) на журнале A против
+     фактических решений PAPER A, REPLAY записи.
+С кодом 11.11 у каждой строки записи и журнала есть m — локальное монотонное время сервера (CLOCK_MONOTONIC, общее для
+процессов): тогда «раньше/позже» между процессами считается по нему, а по поправкам часов — для сравнения (разница двух
+оценок — ошибка поправки). Поправка каждого процесса — последняя CLOCK до T0 (история — в разделе 1).
   python3 tools/p0_three_way.py VLXUSDT
   python3 tools/p0_three_way.py --rec logs/rec_X.jsonl.gz --journal logs/paperrec_X.jsonl.gz --paper logs/paper_X.jsonl
 """
@@ -23,9 +30,10 @@ import json
 from argparse import Namespace
 from pathlib import Path
 
+import cap_replay
 import paper_vs_replay as pvr
-from core.cap_breakout import MAIN_EARLY_PAPER, ORDER_USDT
-from core.feed import iter_lines
+from core.cap_breakout import MAIN_EARLY_PAPER, ORDER_USDT, CapEngine, Opts
+from core.feed import events_of, frame_meta, iter_lines
 from main_replay import LOGS, load_open
 
 WIN_FROM_MS, WIN_TO_MS, FIRST_MS = -5_000, 60_000, 2_000
@@ -49,26 +57,29 @@ class Conn:
 
     def __init__(self, name: str, offset: int):
         self.name, self.offset = name, offset
-        self.depth: dict[int, tuple[int, int]] = {}
-        self.deals: dict[tuple, tuple[int, int]] = {}
+        self.depth: dict[int, tuple] = {}  # toVersion → (получено, sendTime, m)
+        self.deals: dict[tuple, tuple] = {}
         self.delays: list[tuple[int, int]] = []  # (sendTime, получено − sendTime)
         self.first_after_t0: tuple[int, int] | None = None
         self.events: list[tuple[int, str, dict]] = []
+        self.n = self.n_m = 0
 
-    def frame(self, t: int, send: int | None, depth: tuple | None, deals: list, t0: int) -> None:
+    def frame(self, t: int, send: int | None, depth: tuple | None, deals: list, t0: int, m: float | None = None) -> None:
         if not depth and not deals:  # у записи есть и другие каналы; сравниваются только общие (сделки, diff-ы)
             return
+        self.n += 1
+        self.n_m += m is not None
         if send:
             self.delays.append((send, t - send))
         if t >= t0 and self.first_after_t0 is None:
             self.first_after_t0 = (t, send)
         if depth:
-            self.depth.setdefault(int(depth[1]), (t, send))
+            self.depth.setdefault(int(depth[1]), (t, send, m))
         for d in deals:
-            self.deals.setdefault((str(d[0]), str(d[1]), str(d[2])), (t, send))
+            self.deals.setdefault((str(d[0]), str(d[1]), str(d[2])), (t, send, m))
 
     def raw(self, t: int) -> int:
-        """Локальное время сервера (без поправки часов процесса) — для сравнения процессов между собой."""
+        """Локальное время сервера по поправке часов процесса — для сравнения процессов, если нет m."""
         return t - self.offset
 
 
@@ -85,15 +96,24 @@ def ws_parts(data: dict):
 
 
 def load_paper_log(path: Path) -> dict:
-    out = dict(offset=None, clock=[], decisions=[], summary=None, start=None)
+    out = dict(offset=None, clock=[], decisions=[], summary=None, start=None, conn=[], start_paper={}, cap={},
+               review=[])
     with path.open(encoding="utf-8") as f:
         for line in f:
             e = json.loads(line)
             ev = e.get("event")
             if ev == "START_PAPER":
                 out["offset"] = e.get("clock_offset_ms")
+                out["start_paper"] = e
             elif ev == "CLOCK":
                 out["clock"].append((e["t"], e.get("offset_ms")))
+                out["conn"].append(e)
+            elif ev in ("WS_CONNECTED", "WS_ERROR", "CLOCK_FROZEN", "CLOCK_ERROR", "JOURNAL_CLOSED"):
+                out["conn"].append(e)
+            elif ev in ("CAP", "CAP_RELEASE", "CAP_DONE"):
+                out["cap"][ev] = e
+            elif ev in ("LOOP_LAG", "SLOW_FRAME"):
+                out["review"].append(e)
             elif ev == "DECISION":
                 out["decisions"].append(e)
             elif ev == "SUMMARY":
@@ -118,7 +138,11 @@ def load_rec(path: Path, t0_hint: int | None):
         if src == "event":
             if ch == "START":
                 offset = (data or {}).get("clock_offset_ms") or 0
-            if ch in ("WS_CONNECTED", "WS_ERROR", "WS_CLOSED", "START", "OPEN_DETECTED"):
+            t0 = t0_hint or first_open
+            if ch == "CLOCK" and (t0 is None or e["t"] <= t0):
+                offset = (data or {}).get("offset_ms", offset)  # последняя поправка до T0 (за 5 мин она заморожена)
+            if ch in ("WS_CONNECTED", "WS_ERROR", "WS_CLOSED", "START", "OPEN_DETECTED", "CLOCK", "CLOCK_FROZEN",
+                      "CLOCK_ERROR"):
                 events.append((e["t"], ch, data))
             continue
         if ch == "exchangeInfo" and isinstance(data, dict):
@@ -151,6 +175,45 @@ def load_journal(path: Path):
     return open_ms, a, b, ev
 
 
+def cap_paper_path(path: Path, cfg) -> tuple[CapEngine | None, list[dict]]:
+    """Путь PAPER для CAP BREAKOUT на журнале A: движок создаётся там же, где в PAPER (событие CAP_ENGINE, между
+    кадрами), с последним exchangeInfo; первая сделка выше потолка и снятие — по потоку; завершение — по CAP_DONE."""
+    eng, info = None, {}
+    for line in iter_lines(path):
+        e = json.loads(line)
+        src, ch, data = e.get("src"), e.get("ch"), e.get("data")
+        if src == "event":
+            if ch == "CAP_ENGINE" and eng is None:
+                eng = CapEngine(cfg, Opts(), data["cap"], data["open_ms"], info)
+            elif ch == "CAP_DONE" and eng is not None:
+                if eng.release is not None:
+                    eng.finish(e["t"])
+                break
+            continue
+        if src == "ws_shadow":
+            continue
+        if ch == "exchangeInfo" and isinstance(data, dict):
+            info = (data.get("symbols") or [{}])[0] or info
+            if eng is not None and eng.release is None:
+                eng.info = info
+            continue
+        if eng is not None:
+            for t, kind, ev in events_of(e):
+                eng.on_event(t, kind, ev, *frame_meta(e))
+    if eng is None or eng.release is None:
+        return eng, []
+    return eng, eng.rows(path.name.split("_")[1])
+
+
+def cap_replay_path(path: Path, cfg, cap: float) -> tuple[int | None, int | None, list[dict]]:
+    """REPLAY CAP BREAKOUT по записи или журналу (cap_replay.run_causal): с T0, первая сделка выше потолка и снятие —
+    по потоку в порядке получения, без знания будущего."""
+    eng, _ = cap_replay.run_causal(path, cfg, Opts(), cap)
+    if eng is None:
+        return None, None, []
+    return eng.cand_ms, eng.release, eng.rows(path.name.split("_")[1]) if eng.release else []
+
+
 def compare_rows(name: str, rows_a: list[dict], rows_b: list[dict], t0: int, show: int = 4) -> list[str]:
     ka = {pvr.key(r): r for r in rows_a}
     kb = {pvr.key(r): r for r in rows_b}
@@ -179,6 +242,9 @@ def main() -> None:
     jr_path = Path(a.journal) if a.journal else find(f"paperrec_{sym}_2*.jsonl.gz")
     pl_path = Path(a.paper) if a.paper else find(f"paper_{sym}_2*.jsonl")
     print(f"запись {rec_path}\nжурнал PAPER {jr_path}\nлог PAPER {pl_path}")
+    from core.data_marks import mark_line
+    if (ml := mark_line(sym)):
+        print(ml)
     if not (rec_path and jr_path and pl_path):
         raise SystemExit("нужны все три файла")
 
@@ -191,37 +257,49 @@ def main() -> None:
     for e in rec_frames:
         if e.get("src") == "ws_pub" and isinstance(e.get("data"), dict):
             depth, deals = ws_parts(e["data"])
-            conns["запись"].frame(e["t"], int(e["data"].get("sendTime") or 0) or None, depth, deals, t0)
+            conns["запись"].frame(e["t"], int(e["data"].get("sendTime") or 0) or None, depth, deals, t0, e.get("m"))
     for e in a_frames:
         if e.get("src") == "ws_pub" and isinstance(e.get("data"), dict):
             depth, deals = ws_parts(e["data"])
-            conns["A"].frame(e["t"], int(e["data"].get("sendTime") or 0) or None, depth, deals, t0)
+            conns["A"].frame(e["t"], int(e["data"].get("sendTime") or 0) or None, depth, deals, t0, e.get("m"))
     for e in b_frames:
         d = e.get("data") or {}
         depth = (d.get("fromVersion"), d.get("toVersion")) if d.get("toVersion") else None
         deals = d.get("deals") if isinstance(d.get("deals"), list) else []
-        conns["B"].frame(e["t"], int(d.get("sendTime") or 0) or None, depth, deals, t0)
+        conns["B"].frame(e["t"], int(d.get("sendTime") or 0) or None, depth, deals, t0, e.get("m"))
+    use_m = all(c.n and c.n_m == c.n for c in conns.values())
 
     out = [f"\n# {rec_path.name.split('_')[1]}: T0 {t0} (firstOpenTime {first_open}, OPEN_DETECTED PAPER {open_ms})"]
-    out.append(f"поправка часов: запись {rec_offset} мс, PAPER {p_off} мс (разница {p_off - rec_offset:+d} мс); "
-               f"время кадра каждого процесса — в шкале биржи; «раньше/позже» — по локальным часам сервера")
+    out.append(f"поправка часов на T0: запись {rec_offset} мс, PAPER {p_off} мс (разница {p_off - rec_offset:+d} мс); "
+               f"время кадра каждого процесса — в шкале биржи; «раньше/позже» между процессами — "
+               + ("по монотонным часам сервера (поле m)" if use_m else "по поправкам часов (поля m нет — код до 11.11)"))
 
     st = log["start"] or {}
     out.append(f"версии: код PAPER {st.get('code')}, предрегистрация {st.get('prereg')}, модель исполнения "
                f"{st.get('exec_model')}, комиссии {st.get('fees')}, веток {st.get('sims')}; конфигурация — START_PAPER")
-    out.append("\n## 1. Соединения")
+    out.append("\n## 1. Соединения и часы")
     for t, ch, data in rec_ev:
         if ch.startswith("WS"):
             out.append(f"  запись {ch} T0{t - t0:+d} мс {data}")
-    for t, ch, data in jev:
-        if ch.startswith("WS") or ch == "CLOCK":
-            out.append(f"  PAPER {ch} T0{t - t0:+d} мс {data}")
+    for e in log["conn"]:  # из лога PAPER: подключения были за часы до T0 и в журнал (окно T0 − 2 мин) не попадают
+        if e["event"].startswith("WS"):
+            out.append(f"  PAPER {e.get('conn')} {e['event']} T0{e['t'] - t0:+d} мс {e.get('remote') or e.get('error')}")
+    out.append("  синхронизация часов (последние до T0 и все после; поправка, изменение, RTT лучшего запроса, выборка RTT):")
+    rclk = [(t, ch, d) for t, ch, d in rec_ev if ch.startswith("CLOCK")]
+    pclk = [(e["t"], e["event"], e) for e in log["conn"] if e["event"].startswith("CLOCK")]
+    for who, xs in (("запись", rclk), ("PAPER", pclk)):
+        before = [x for x in xs if x[0] <= t0][-3:]
+        for t, ch, d in before + [x for x in xs if x[0] > t0]:
+            out.append(f"    {who} {ch} T0{t - t0:+d} мс: поправка {d.get('offset_ms')}, изменение {d.get('change_ms')}, "
+                       f"RTT {d.get('rtt_ms')} {d.get('rtts') or ''}")
+        if not xs:
+            out.append(f"    {who}: событий CLOCK нет (одна синхронизация при старте, код до 11.11)")
 
     lo, hi = t0 + WIN_FROM_MS, t0 + WIN_TO_MS
     missing: dict[str, dict] = {}
     out.append(f"\n## 2. Доступность событий (sendTime от T0{WIN_FROM_MS:+d} до T0+{WIN_TO_MS} мс)")
     for what in ("depth", "deals"):
-        sets = {n: {k for k, (t, s) in getattr(c, what).items() if s and lo <= s <= hi} for n, c in conns.items()}
+        sets = {n: {k for k, (t, s, _m) in getattr(c, what).items() if s and lo <= s <= hi} for n, c in conns.items()}
         union = set().union(*sets.values())
         miss = {n: len(union - s) for n, s in sets.items()}
         missing[what] = miss
@@ -239,25 +317,60 @@ def main() -> None:
         all_d = [d for s, d in c.delays if lo <= s <= hi]
         first = [d for s, d in c.delays if t0 <= s <= t0 + FIRST_MS]
         out.append(f"  {n}: получение − sendTime: окно {stats(all_d)}; первые {FIRST_MS} мс {stats(first)}")
+    def local_diff(cx: Conn, cy: Conn, ex: tuple, ey: tuple, by_m: bool) -> float:
+        return ex[2] - ey[2] if by_m else cx.raw(ex[0]) - cy.raw(ey[0])
+
     for x, y in (("A", "запись"), ("B", "запись"), ("A", "B")):
         cx, cy = conns[x], conns[y]
         for what in ("depth", "deals"):
-            common = [k for k in getattr(cx, what) if k in getattr(cy, what)]
-            dd = [cx.raw(getattr(cx, what)[k][0]) - cy.raw(getattr(cy, what)[k][0]) for k in common
-                  if getattr(cx, what)[k][1] and lo <= getattr(cx, what)[k][1] <= hi]
-            first = [cx.raw(getattr(cx, what)[k][0]) - cy.raw(getattr(cy, what)[k][0]) for k in common
-                     if getattr(cx, what)[k][1] and t0 <= getattr(cx, what)[k][1] <= t0 + FIRST_MS]
-            out.append(f"  {x} − {y}, {'diff-ы' if what == 'depth' else 'сделки'}: окно {stats(dd)}; "
-                       f"первые {FIRST_MS} мс {stats(first)}")
+            ax, ay = getattr(cx, what), getattr(cy, what)
+            common = [k for k in ax if k in ay and ax[k][1]]
+            for by_m in ([True, False] if use_m else [False]):
+                dd = [local_diff(cx, cy, ax[k], ay[k], by_m) for k in common if lo <= ax[k][1] <= hi]
+                first = [local_diff(cx, cy, ax[k], ay[k], by_m) for k in common if t0 <= ax[k][1] <= t0 + FIRST_MS]
+                how = "" if not use_m else " (монотонные)" if by_m else " (по поправкам часов)"
+                out.append(f"  {x} − {y}, {'diff-ы' if what == 'depth' else 'сделки'}{how}: окно {stats(dd)}; "
+                           f"первые {FIRST_MS} мс {stats(first)}")
     out.append("  первый WS-кадр после T0 (получен; sendTime): " + "; ".join(
         f"{n} T0{c.first_after_t0[0] - t0:+d} мс; T0{(c.first_after_t0[1] or t0) - t0:+d} мс"
         for n, c in conns.items() if c.first_after_t0))
-    after = sorted({v for c in conns.values() for v, (t, s) in c.depth.items() if s and s >= t0})[:FIRST_VERSIONS]
+    after = sorted({v for c in conns.values() for v, (t, s, _m) in c.depth.items() if s and s >= t0})[:FIRST_VERSIONS]
     out.append("  первые diff-ы после T0: toVersion, sendTime − T0, получение − T0 (запись / A / B), мс")
     for v in after:
         send = next((c.depth[v][1] for c in conns.values() if v in c.depth), None)
         cells = [f"{c.depth[v][0] - t0:+d}" if v in c.depth else "нет" for c in conns.values()]
         out.append(f"    {v}: {send - t0:+d}; {' / '.join(cells)}")
+
+    procs: dict[int, list] = {}  # время кадра → PROC по порядку (у нескольких кадров одно время)
+    for t, ch, d in jev:
+        if ch == "PROC":
+            procs.setdefault(t, []).append(d)
+    clk_a = [(e["t"], e.get("offset_ms"), e.get("rtt_ms")) for e in log["conn"] if e["event"] == "CLOCK"]
+    off_a = [c for c in clk_a if c[0] <= t0][-1:] or [(None, p_off, None)]
+    out.append(f"  покадрово, первые {FIRST_MS} мс (PAPER A; поправка часов {off_a[0][1]} мс, RTT синхронизации "
+               f"{off_a[0][2]} мс, заморожена с T0 − 5 мин):")
+    out.append("    sendTime−T0 | получено A−T0 | доставка | A−запись" + (" (m)" if use_m else "")
+               + " | разбор, стакан, запуск, BASELINE, эксп. ветки, учёт, журнал, всего, мс; очередь кадров | пауза до кадра, мс")
+    for e in a_frames:
+        if not t0 <= e["t"] <= t0 + FIRST_MS or not events_of(e):
+            continue
+        q = procs.get(e["t"]) or []
+        pr = q.pop(0) if q else {}  # PROC пишется на каждый кадр с событиями (в т. ч. REST-снимок), по порядку
+        d = e.get("data")
+        if e.get("src") != "ws_pub" or not isinstance(d, dict) or not d.get("sendTime"):
+            continue
+        send = int(d["sendTime"])
+        depth, deals = ws_parts(d)
+        key = ("depth", int(depth[1])) if depth else ("deals", tuple(str(x) for x in deals[0])) if deals else None
+        other = getattr(conns["запись"], key[0]).get(key[1]) if key else None
+        mine = getattr(conns["A"], key[0]).get(key[1]) if key else None
+        vs = (f"{local_diff(conns['A'], conns['запись'], mine, other, use_m):+.1f}" if other and mine else "нет")
+        stages = (", ".join(f"{pr.get(k, '-')}" for k in ("parse", "book", "start", "base", "exp", "track", "jw", "total",
+                                                          "q"))
+                  if "total" in pr else f"только движки {pr['ms']} (журнал до 11.11)" if "ms" in pr else "-")
+        kind = f"diff {depth[1]}" if depth else f"сделки {len(deals)}"
+        out.append(f"    {send - t0:+d} | {e['t'] - t0:+d} | {e['t'] - send:+d} | {vs} | {stages} | "
+                   f"{pr.get('gap', '-')} ({kind})")
 
     out.append("\n## 4. PAPER A локально (окно журнала)")
     proc = [d["ms"] for t, ch, d in jev if ch == "PROC"]
@@ -275,9 +388,21 @@ def main() -> None:
     out.append(f"  обработка кадров в первые {FIRST_MS} мс: {len(first_proc)} кадров, сумма "
                f"{sum(m for _, m in first_proc):.1f} мс, дольше 5 мс: "
                + (", ".join(f"T0{t:+d} — {m:.1f}" for t, m in first_proc if m > 5) or "нет"))
+    for t, ch, d in jev:
+        if ch == "LOOP_LAG" and d.get("where"):
+            out.append(f"  LOOP_LAG T0{t - t0:+d} мс {d['lag_ms']} мс: {d['where']}"
+                       + (f"; потоки {d.get('threads')}" if d.get("threads") else ""))
     summ = log["summary"] or {}
-    lagd = summ.get("lag") or {}
+    lagd = dict(summ.get("lag") or {})
+    for k in ("stages", "loop_lag_max_where"):
+        if lagd.get(k):
+            out.append(f"  {k}: {json.dumps(lagd.pop(k), ensure_ascii=False)}")
     out.append(f"  SUMMARY: {json.dumps(lagd, ensure_ascii=False)}")
+    if summ.get("journal"):
+        out.append(f"  журнал PAPER (объём и время записи строк): {json.dumps(summ['journal'], ensure_ascii=False)}")
+    for e in log["review"]:
+        out.append(f"  в логе PAPER (> 50 мс): {e['event']} T0{e['t'] - t0:+d} мс "
+                   + json.dumps({k: v for k, v in e.items() if k not in ('t', 'event')}, ensure_ascii=False))
 
     out.append("\n## 5. Разложение до первого решения")
     cfg = Namespace(latency=[50], usdt=[ORDER_USDT], sweep=False, main_early=MAIN_EARLY_PAPER)
@@ -323,6 +448,47 @@ def main() -> None:
     out.append(f"  MODEL_UNVERIFIED (время кадров восстановлено после остановки процесса): журнал A "
                f"{(load_open(jr_path)[3] or {}).get('stalled_frames', 0)} кадров; запись "
                f"{(load_open(rec_path)[3] or {}).get('stalled_frames', 0)} кадров")
+
+    cap_ev = log["cap"].get("CAP")
+    out.append("\n## 8. CAP BREAKOUT")
+    if not cap_ev:
+        out.append("  потолка нет (или не найден в логе пробы) — раздел не нужен")
+    else:
+        cap = float(cap_ev["cap"])
+        out.append(f"  потолок {cap} ({cap_ev.get('src')}); журнал открыт при обнаружении потолка: "
+                   f"{cap_ev.get('journal_open', 'нет сведений (код до 11.11)')}")
+        for t, ch, d in jev:
+            if ch in ("CAP_ENGINE", "CAP_CAND", "CAP_RELEASE", "CAP_BOOK_VALID", "CAP_BOOK_INVALID", "CAP_DONE",
+                      "JOURNAL_END") or (ch in ("DECISION", "SIM_ENTRY", "SIM_TP", "SIM_EXIT_START", "SIM_EXIT")
+                                         and d.get("engine") == "cap"):
+                out.append(f"    {ch} T0{t - t0:+d} мс {json.dumps(d, ensure_ascii=False)}")
+        cap_cfg = Namespace(**(log["start_paper"].get("cap_cfg") or {}))
+        actual_cap = (summ.get("rows") or {}).get("cap", [])
+        if not vars(cap_cfg):
+            out.append("  нет cap_cfg в START_PAPER — путь PAPER не повторить")
+        else:
+            eng, rows = cap_paper_path(jr_path, cap_cfg)
+            if eng is None:
+                out.append("  в журнале нет CAP_ENGINE (журнал закрылся раньше или код до 11.11)")
+            else:
+                out.append(f"  путь PAPER на журнале A: первая сделка выше потолка "
+                           f"{'T0%+d мс' % (eng.cand_ms - t0) if eng.cand_ms else 'нет'}, снятие "
+                           f"{'T0%+d мс' % (eng.release - t0) if eng.release else 'нет'}")
+                if actual_cap or rows:
+                    out += compare_rows("путь PAPER (CAP) на журнале A против фактического PAPER A", rows, actual_cap, t0)
+            cand_j, rel_j, rows_j = cap_replay_path(jr_path, cap_cfg, cap)
+            out.append(f"  REPLAY (CAP) журнала A: первая сделка выше потолка "
+                       f"{'T0%+d мс' % (cand_j - t0) if cand_j else 'нет'}, снятие "
+                       f"{'T0%+d мс' % (rel_j - t0) if rel_j else 'нет'}")
+            if rows_j:
+                out += compare_rows("REPLAY (CAP) журнала A против фактического PAPER A", rows_j, actual_cap, t0)
+            cand_r, rel_r, rows_r = cap_replay_path(rec_path, cap_cfg, cap)
+            out.append(f"  REPLAY (CAP) записи: первая сделка выше потолка "
+                       f"{'T0%+d мс' % (cand_r - t0) if cand_r else 'нет'}, снятие "
+                       f"{'T0%+d мс' % (rel_r - t0) if rel_r else 'нет'}")
+            if rows_r:
+                out += compare_rows("REPLAY (CAP) записи против фактического PAPER A (разные соединения)", rows_r,
+                                    actual_cap, t0)
     print("\n".join(out))
 
 
