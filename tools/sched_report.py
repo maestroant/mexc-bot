@@ -8,7 +8,7 @@
 Признак (не доказательство): RUNQUEUE — PAPER ждал в очереди ≥ половины задержки; OWN_CPU — PAPER сам был на CPU ≥
 половины задержки (тогда смотреть PROC/StallSampler); STEAL — гипервизор забирал CPU; DISK — запись на диск в
 интервале; иначе UNDETERMINED. Для доказательства нужен воспроизводимый тест — признак только сужает поиск.
-Плюс профиль по секундам T0 − 150 … T0 + 60 с.
+Плюс профиль по секундам T0 − 10 … T0 + 10 с и steal гипервизора по окну.
   python3 tools/sched_report.py SYMBOL [--sched FILE] [--journal FILE]
 """
 
@@ -128,7 +128,8 @@ def fmt(d: dict) -> str:
                  f"вынужд. перекл. {pp.get('nvol', 0)}")
     for name in ("listing_recorder", "probe_listing", "listing_watcher"):
         if (o := d.get(name)) and o["run_ms"] >= 1:
-            parts.append(f"{name.split('_')[-1]} на CPU {o['run_ms']:.1f} мс")
+            label = {"listing_recorder": "запись", "probe_listing": "проба", "listing_watcher": "наблюдатель"}[name]
+            parts.append(f"{label} на CPU {o['run_ms']:.1f} мс")
     parts.append(f"ядер занято {d.get('busy_cores', '?')}, steal {d.get('steal_ms', 0):.0f} мс, PSI {d.get('psi_some_ms', 0):.1f} мс, "
                  f"диск {d.get('disk_kb', 0):.0f} КБ / {d.get('disk_ms', 0)} мс, в очереди готовых {d.get('procs_running')}")
     return "; ".join(parts)
@@ -166,6 +167,17 @@ def main() -> None:
             sk = [s.get("sock") for s in br if s.get("sock")]
             if sk:
                 print(f"      сокеты PAPER, байт в очереди приёма ОС (до Python): {sk[0]} → {sk[-1]}")
+    total, spikes = 0.0, []
+    for a, b in zip(samples, samples[1:]):  # steal гипервизора по всему окну: шаг замеров — 100 мс (1 с до окна)
+        ca, cb = a["sys"]["cpu"].get("cpu"), b["sys"]["cpu"].get("cpu")
+        if ca and cb:
+            st = (cb[7] - ca[7]) * 1000 / tick
+            total += st
+            if st >= 30:
+                rel = f"T0{(b['w'] - open_ms) / 1000:+.1f} с" if open_ms else str(b["w"])
+                spikes.append(f"{rel}: {st:.0f} мс за {b['m'] - a['m']:.0f} мс")
+    print(f"\nsteal гипервизора за окно профиля: {total:.0f} мс (сумма по ядрам); интервалов ≥ 30 мс: {len(spikes)}"
+          + (" — " + "; ".join(spikes[:20]) if spikes else ""))
     if open_ms:
         print("\nпо секундам, T0 − 10 … T0 + 10 с:")
         w0 = next((s for s in samples if s["w"] >= open_ms - 10_000), None)

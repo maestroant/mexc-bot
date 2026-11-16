@@ -326,7 +326,9 @@ def print_baseline_summary(rows: list[dict], metas: list[dict], latency: int, us
 
 def print_early(rows: list[dict], metas: list[dict], latency: int, top: int) -> None:
     syms = sorted({m["symbol"] for m in metas if m["group"] == "no_cap"})
-    early = [r for r in rows if r["mode"] == "MAIN_EARLY" and r["latency"] == latency]
+    # только листинги основной выборки (группа no_cap): до 16.11 сюда попадали строки VLX (метка core/data_marks) —
+    # рейтинг, «без лучшего листинга» и выходы считались с ним; найдено автоматической проверкой p0_sample_audit M1
+    early = [r for r in rows if r["mode"] == "MAIN_EARLY" and r["latency"] == latency and r["symbol"] in syms]
     if not early:
         return
     rec = [r for r in early if r.get("data_quality") == RECON]

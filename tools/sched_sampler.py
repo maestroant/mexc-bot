@@ -1,7 +1,7 @@
 """Профиль CPU и планировщика вокруг открытия листинга (решение клиента 13.11, п. 6) — отдельный процесс, без вмешательства
 в цикл событий PAPER. Ни одного ордера; один публичный запрос exchangeInfo раз в 30 с (время открытия, перенос).
 
-Что снимается (Linux /proc и cgroup v2), каждые FAST_MS мс в окне T0 − PRE_S … T0 + POST_S и раз в секунду до него:
+Что снимается (Linux /proc и cgroup v2), каждые FAST_MS мс в окне T0 − PRE_S … T0 + POST_S (150 / 300 с) и раз в секунду до него:
   по процессам листинга (paper.py, listing_recorder.py, probe_listing.py этой пары, listing_watcher.py) и самому себе:
     utime/stime (/proc/pid/stat), run_ns/wait_ns/slices (/proc/pid/schedstat: время на CPU и ожидание в очереди
     планировщика — «scheduler delay»), voluntary/nonvoluntary context switches (/proc/pid/status);
@@ -27,7 +27,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 LOGS = ROOT / "logs"
-PRE_S, POST_S = 150, 60
+PRE_S, POST_S = 150, 300  # после — до конца журнала PAPER (T0 + 5 мин); WASTED 15.11: лаги на +122/+180 с были вне окна
 TICK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 CGROUP = Path("/sys/fs/cgroup/system.slice/mexc-listing-watcher.service")
 SCRIPTS = ("paper.py", "listing_recorder.py", "probe_listing.py", "listing_watcher.py")

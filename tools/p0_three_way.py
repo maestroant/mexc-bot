@@ -334,8 +334,12 @@ def main() -> None:
     out.append("  первый WS-кадр после T0 (получен; sendTime): " + "; ".join(
         f"{n} T0{c.first_after_t0[0] - t0:+d} мс; T0{(c.first_after_t0[1] or t0) - t0:+d} мс"
         for n, c in conns.items() if c.first_after_t0))
-    after = sorted({v for c in conns.values() for v, (t, s, _m) in c.depth.items() if s and s >= t0})[:FIRST_VERSIONS]
-    out.append("  первые diff-ы после T0: toVersion, sendTime − T0, получение − T0 (запись / A / B), мс")
+    # только окно сравнения: запись загружается до T0 + WIN_TO_MS + 30 с, журнал PAPER — дольше; без этой границы
+    # поздние версии выглядели «нет» у записи (WASTED 15.11), хотя запись их получила
+    after = sorted({v for c in conns.values() for v, (t, s, _m) in c.depth.items()
+                    if s and t0 <= s <= t0 + WIN_TO_MS})[:FIRST_VERSIONS]
+    out.append(f"  первые diff-ы после T0 (sendTime до T0 + {WIN_TO_MS // 1000} с): toVersion, sendTime − T0, "
+               f"получение − T0 (запись / A / B), мс")
     for v in after:
         send = next((c.depth[v][1] for c in conns.values() if v in c.depth), None)
         cells = [f"{c.depth[v][0] - t0:+d}" if v in c.depth else "нет" for c in conns.values()]
