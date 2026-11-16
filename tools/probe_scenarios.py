@@ -641,8 +641,11 @@ def late_balance_growth_blocks(tmp):
     pl.time.sleep(31 * 60)
     out = sup.run_once(ex, rp)
     st = state(tmp)
-    return (bool(out["late"]) and out["late"][-1][1] == "LATE_APPEARANCE" and st["blocked"] and not ex.posts,
-            "остаток базовой валюты вырос после «ордера нет» без пробной позиции — LATE_APPEARANCE и блокировка")
+    o = st["orders"]["market_late1"]
+    return (bool(out["late"]) and out["late"][-1][1] == "LATE_SUSPECT" and st["blocked"] and not ex.posts
+            and o["status"] == "NOT_PLACED_RECONCILED" and o["late_suspect"]["now"] == "3",
+            "остаток вырос после «ордера нет» без найденной сделки — LATE_SUSPECT: подозрение, блокировка, статус "
+            "ордера не меняется, продажи нет")
 
 
 @scenario
@@ -952,6 +955,55 @@ def cap_pure_36_when_gates_off(tmp):
     finally:
         pl.CAP_GATE_SELF_SYMBOLS, pl.CAP_GATE_STEP = old
     return (len(ex.posts) == 3, "G1/G2 выключены (откат): чистое правило 3/6 — 3 принятых при неизменной цене")
+
+
+def journal(pr: pl.Probe, check: str) -> list[dict]:
+    pr.log.flush()
+    return [e for e in (json.loads(x) for x in pr.log_path.read_text(encoding="utf-8").splitlines() if x.strip())
+            if e.get("check") == check]
+
+
+@scenario
+def cap_g2_suppression_journaled(tmp):
+    ex = Exchange([{"open": True}] * 5)
+    pr = cap_probe(ex, tmp)
+    cap_round(pr, 1)  # принята по цене P
+    cap_round(pr, 1, rise=Decimal("0.05"))  # цена пробы выше P, но ниже P × 1,1 — подавлена, CAP мог быть пропущен
+    cap_round(pr, 1, rise=Decimal("-0.2"))  # ниже P — подавлена, нового не скажет
+    sup = journal(pr, "cap_suppressed")
+    need = {"gate", "why", "probe_price", "max_accepted_price", "book_ts", "version", "cap_may_have_been_missed"}
+    flags = [e["cap_may_have_been_missed"] for e in sup]
+    lines = pr.cap_lines() if hasattr(pr, "cap_lines") else []
+    return (len(ex.posts) == 1 and len(sup) == 2 and all(need <= set(e) for e in sup) and flags == [True, False]
+            and len(pr.cap_missed) == 1,
+            "пилот G2: каждая подавленная проба в журнале (причина, цены, время данных, версия); проба выше принятой "
+            "цены — CAP_MAY_HAVE_BEEN_MISSED, ниже — нет")
+
+
+@scenario
+def cap_g1_unknown_is_not_absent(tmp):
+    ex = Exchange([{"open": True}] * 2)
+    pr = cap_probe(ex, tmp, listed=False)
+    pr.self_last_ok_ts = None  # selfSymbols не отвечал
+    cap_round(pr, 1)
+    unknown = journal(pr, "cap_suppressed")[-1]["why"]
+    pr.self_last_ok_ts = pl.now_ms()  # ответил, пары нет
+    cap_round(pr, 1)
+    absent = journal(pr, "cap_suppressed")[-1]["why"]
+    return (not ex.posts and "неизвестно" in unknown and "не было в selfSymbols" in absent,
+            "G1: недоступный selfSymbols записывается как «неизвестно», не как «пары нет»; подачи нет в обоих случаях")
+
+
+@scenario
+def cap_no_cap_observed_wording(tmp):
+    ex = Exchange([{"open": True}] * 3)
+    pr = cap_probe(ex, tmp)
+    pr.args.cap_test = True
+    pr.open_price = None
+    cap_round(pr, 3, rise=Decimal("0.2"))
+    text = " ".join(pr.cap_lines())
+    return ("NO_CAP_OBSERVED: для отправленных цен" in text and "потолка нет ниже" not in text and "CAP_ABSENT" in text,
+            "NO_CAP_OBSERVED — только наблюдение по фактически отправленным ценам, без «потолка нет ниже X»")
 
 
 @scenario

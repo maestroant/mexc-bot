@@ -82,9 +82,11 @@ MAX_API_ORDERS = 3  # API_AVAILABILITY_PROBE: всего реальных под
 # реестра ордеров (logs/probe_risk.json), перезапуск процесса их не обнуляет. Окно — от firstOpenTime пары.
 CAP_MAX_ACCEPTED = 3
 CAP_MAX_SUBMITS = 6
-# Read-only условия перед подачей (только убирают подачи, пределы не меняют; предложены клиенту 13.11 на подтверждение,
-# исторический прогон tools/cap_probe_limit_study.py). Выключить: CAP_GATE_SELF_SYMBOLS = False, CAP_GATE_STEP = None —
-# остаётся чистое правило 3/6.
+# Read-only условия перед подачей (только убирают подачи, пределы не меняют). Решение клиента 13.11 (пакет A–E):
+# 3/6 — APPROVED; G1 — CONTROLLED PILOT; G2 — CONTROLLED RESEARCH PILOT, не общая политика; коэффициент не подбирать.
+# Каждая подавленная подача пишется в журнал (cap_suppressed) с причиной, ценами, временем данных и версией; случаи,
+# где подавленная проба могла бы получить 30010, считаются как CAP_MAY_HAVE_BEEN_MISSED. Исторический прогон —
+# tools/cap_probe_limit_study.py (in-sample). Откат к чистому 3/6: CAP_GATE_SELF_SYMBOLS = False, CAP_GATE_STEP = None.
 CAP_GATE_SELF_SYMBOLS = True  # G1: не подавать, пока пары ни разу не было в selfSymbols (API пары не открыт → 10007)
 CAP_GATE_STEP = Decimal("0.10")  # G2: подавать, только если цена пробы ≥ макс. принятой цены пробы × (1 + шаг)
 PROBE_WINDOW_BEFORE_MS = 10 * 60_000  # подачи пары, учитываемые в счётчиках: с firstOpenTime − 10 мин
@@ -136,6 +138,14 @@ def load_dotenv(path: Path) -> None:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
+def code_label() -> str:
+    """Метка выкладки (файл VERSION) — для журнала подавленных проб."""
+    try:
+        return (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        return "?"
 
 
 def now_ms() -> int:
@@ -288,6 +298,9 @@ class Probe:
         self.api_orders = 0
         self.tech_rejects: dict[str, int] = {}  # проверка → технических отказов
         self.self_listed = False  # G1: пара хотя бы раз была в selfSymbols (API для неё открыт этому аккаунту)
+        self.self_first: dict | None = None  # G1: когда пара впервые увидена в selfSymbols (время, T0+, источник)
+        self.self_last_ok_ts: int | None = None  # время последнего успешного ответа selfSymbols (свежесть)
+        self.cap_missed: list[dict] = []  # CAP_MAY_HAVE_BEEN_MISSED: подавленные G2 пробы выше доказанной цены
         self.api_restored = False  # подтверждение API восстановлено из реестра после перезапуска
         self.last_reconcile = 0.0
         self.limit_done = False  # LIMIT_EXECUTION_RESEARCH — один раунд на пару
@@ -355,8 +368,13 @@ class Probe:
         r = self.client.call("GET", path, signed=signed)
         if r.ok and isinstance(r.body, dict) and isinstance(r.body.get("data"), list):
             listed = self.symbol in r.body["data"]
-            if check == "self_syms" and listed:
-                self.self_listed = True
+            if check == "self_syms":
+                self.self_last_ok_ts = now_ms()
+                if listed and not self.self_listed:
+                    self.self_first = {"ts": self.self_last_ok_ts, "rel_ms": self.rel(),
+                                       "source": "GET /api/v3/selfSymbols (подписанный REST)"}
+                    self.record("cap_g1_seen", r, "G1: пара впервые в selfSymbols", True, self.self_first)
+                self.self_listed = self.self_listed or listed
             self.record(check, r, f"in_list={listed}", listed, {"list_size": len(r.body["data"])})
         else:
             self.record(check, r, r.label(), False, {"body": r.body})
@@ -1267,13 +1285,34 @@ class Probe:
         if h["unresolved"]:
             return "waiting: исход прошлой подачи CAP-пробы не сверен — следующая подача только после сверки"
         if CAP_GATE_SELF_SYMBOLS and not self.self_listed:
-            return "waiting: G1 — пары ещё не было в selfSymbols (API для пары не открыт), подача не нужна"
+            if self.self_last_ok_ts is None or now_ms() - self.self_last_ok_ts > 10_000:
+                return self.suppress("G1", params, h, "selfSymbols недоступен или устарел — состояние пары неизвестно "
+                                                      "(не «пары нет»); подача не выполняется")
+            return self.suppress("G1", params, h, "пары ещё не было в selfSymbols (API для пары не открыт)")
         if params is None:
             return "skipped: no book"
-        if CAP_GATE_STEP is not None and h["max_acc"] is not None                 and Decimal(params["price"]) < h["max_acc"] * (1 + CAP_GATE_STEP):
-            return (f"skipped: G2 — цена пробы ниже принятой {h['max_acc']} × {1 + CAP_GATE_STEP}: потолок ниже уже "
-                    f"исключён, подача ничего нового не скажет")
+        if CAP_GATE_STEP is not None and h["max_acc"] is not None \
+                and Decimal(params["price"]) < h["max_acc"] * (1 + CAP_GATE_STEP):
+            return self.suppress("G2", params, h, f"цена пробы ниже максимальной принятой {h['max_acc']} × "
+                                                  f"{1 + CAP_GATE_STEP}")
         return None
+
+    def suppress(self, gate: str, params: dict | None, h: dict, why: str) -> str:
+        """Пилот G1/G2 (клиент 13.11): каждая подавленная подача — в журнал с причиной, ценами, временем данных и
+        версией. G2 выше уже принятой цены — CAP_MAY_HAVE_BEEN_MISSED: реальная заявка могла бы получить 30010 в
+        интервале (макс. принятая, цена пробы]; пассивный расчёт не равен ответу биржи на неотправленный ордер."""
+        px = Decimal(params["price"]) if params else None
+        missed = bool(gate == "G2" and px is not None and h["max_acc"] is not None and px > h["max_acc"])
+        extra = {"gate": gate, "why": why, "probe_price": str(px) if px is not None else None,
+                 "max_accepted_price": str(h["max_acc"]) if h["max_acc"] is not None else None,
+                 "bid": self.market.bids[0][0] if self.market.bids else None, "last_price": str(self.last_price),
+                 "book_ts": self.book_ts, "self_symbols_last_ok_ts": self.self_last_ok_ts,
+                 "self_symbols_first": self.self_first, "submits": h["submits"], "accepted": h["accepted"],
+                 "cap_may_have_been_missed": missed, "version": code_label()}
+        if missed:
+            self.cap_missed.append({"ts": now_ms(), "rel_ms": self.rel(), "band": [str(h["max_acc"]), str(px)]})
+        self.record("cap_suppressed", None, f"{gate}: {why}", False, extra)
+        return f"skipped: {gate} (пилот) — {why}"
 
     def check_cap_maker(self) -> None:
         """После открытия: LIMIT_MAKER BUY выше вероятного потолка. «Только мейкер» не покупает по рынку:
@@ -1331,12 +1370,17 @@ class Probe:
                          f"30010 ×{len(items)} ({checks})")
         if self.args.cap_test and not seen:
             h = self.cap_probe_history()
+            sent = [f"{o.get('price')} ({self.fmt(int(o['ts'])).strip()})" for o in self.window_orders("cap_maker")
+                    if o.get("orderId")]
             if h["accepted"]:
-                lines.append(f"NO_CAP_OBSERVED_IN_PROBES: 30010 не было; потолка нет ниже {h['max_acc']} "
-                             f"(проверено {self.fmt(h['max_acc_ts']).strip()}; принятых проб {h['accepted']}, подач "
-                             f"{h['submits']}) — это не CAP_ABSENT: потолок выше этой цены или позже не исключён")
+                lines.append(f"NO_CAP_OBSERVED: для отправленных цен {', '.join(sent)} 30010 не получен (подач "
+                             f"{h['submits']}). Это наблюдение только по этим ценам и моментам, не CAP_ABSENT.")
             else:
                 lines.append(f"CAP_UNKNOWN: 30010 не было, принятых CAP-проб нет (подач {h['submits']})")
+        if self.cap_missed:
+            lines.append(f"CAP_MAY_HAVE_BEEN_MISSED: G2 подавил {len(self.cap_missed)} проб выше принятой цены — "
+                         + "; ".join(f"T{m['rel_ms'] / 1000:+.0f} с ({m['band'][0]}; {m['band'][1]}]"
+                                     for m in self.cap_missed[:5] if m["rel_ms"] is not None))
         return lines
 
     # --- цикл -----------------------------------------------------------------

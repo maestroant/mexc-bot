@@ -10,8 +10,9 @@
      аварийная блокировка остаётся до оператора.
   4. Пассивная поздняя сверка (решение клиента 13.11, п. 5): ордера, закрытые как NO_ORDER_CONFIRMED или
      NOT_PLACED_RECONCILED, LATE_WATCH_MS после регистрации раз в LATE_EVERY_MS read-only проверяются снова — ордер по
-     clientOrderId, сделки пары с момента регистрации, остаток базовой валюты. Нашёлся ордер/сделка или остаток вырос —
-     LATE_APPEARANCE: аварийная блокировка, повторная классификация ордера, уведомление. Ордеров не ставит.
+     clientOrderId, сделки пары с момента регистрации, остаток базовой валюты. Нашёлся ордер/сделка по clientOrderId — LATE_APPEARANCE (статус ордера меняется,
+     блокировка, уведомление); остаток вырос без найденной сделки — LATE_SUSPECT (подозрение: блокировка и
+     уведомление, статус ордера не меняется, продажи нет). Ордеров не ставит.
   5. Пишет пульс (supervisor.last_run / last_ok / errors) в состояние. Ошибка сверки — Telegram; три ошибки подряд —
      повторное предупреждение; аварийная блокировка — напоминание не чаще раза в 6 часов.
 Проверка самого супервизора: p0_autoreport и каждый процесс пробы при старте смотрят на возраст пульса.
@@ -89,15 +90,22 @@ def late_check(client, cid: str, o: dict, path: Path) -> str:
                    late_base0=base0 if base0 is not None else (str(bal) if bal is not None else None))
         has_position = sym in st["positions"]
     grew = bal is not None and base0 is not None and bal > pl.Decimal(str(base0)) and not has_position
-    if res == "found" or grew:
-        what = (f"ордер/сделка найдены: {info}" if res == "found"
-                else f"остаток {base} вырос {base0} → {bal} без пробной позиции")
-        risk.register_order(cid, path=path, status="LATE_APPEARANCE", late_was=o.get("status"), late_info=str(info)[:300])
+    if res == "found":  # подтверждено собственным ордером / сделкой по clientOrderId
+        what = f"ордер/сделка найдены по clientOrderId: {info}"
+        risk.register_order(cid, path=path, status="LATE_APPEARANCE", late_was=o.get("status"),
+                            late_info=str(info)[:300])
         risk.block(sym, f"LATE_APPEARANCE: {cid} был закрыт как {o.get('status')}, поздняя сверка — {what}",
                    path=path, clientOrderId=cid)
-        notify(f"!!! {sym}: позднее появление {cid} (был {o.get('status')}): {what}. Пробные BUY заблокированы, "
-               f"нужна сверка оператором.")
+        notify(f"!!! {sym}: позднее появление {cid} (был {o.get('status')}): {what}. Пробные BUY заблокированы; "
+               f"перед любым SELL — сверка фактического количества оператором.")
         return "LATE_APPEARANCE"
+    if grew:  # подозрение, не доказательство: пополнение, ручная сделка, разблокировка, комиссия в базовой валюте
+        what = f"остаток {base} вырос {base0} → {bal} без пробной позиции и без найденной сделки пробы"
+        risk.register_order(cid, path=path, late_suspect={"base0": str(base0), "now": str(bal), "ts": pl.now_ms()})
+        risk.block(sym, f"LATE_SUSPECT: {cid} ({o.get('status')}): {what}", path=path, clientOrderId=cid)
+        notify(f"⚠️ {sym}: подозрение после «ордера нет» {cid}: {what}. Автоматической продажи нет; пробные BUY "
+               f"заблокированы до сверки с историей биржи.")
+        return "LATE_SUSPECT"
     return res
 
 

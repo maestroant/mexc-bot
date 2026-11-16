@@ -649,44 +649,44 @@ class Paper:
 
 
 def cap_probe_status(symbol: str) -> dict:
-    """Почему потолка нет: проба LIMIT_MAKER после открытия работала и 30010 не получила (NO_CAP_OBSERVED) — или
-    не работала: блокировка, нет котируемой валюты, API пары не открыт, нет лога пробы (CAP_UNKNOWN; 30010 не
-    выдумывается). NO_CAP_OBSERVED (= NO_CAP_OBSERVED_IN_PROBES) — не CAP_ABSENT: только «потолка нет ниже
-    максимальной принятой цены пробы» на момент той пробы. Читаются все логи пробы пары за последние 6 ч (перезапуск)."""
+    """Состояние потолка по журналу пробы (решение клиента 13.11, A–E, п. 3.4) — строго наблюдательно:
+    CAP_FOUND — реально получен 30010; NO_CAP_OBSERVED — для перечисленных фактически отправленных цен и моментов 30010
+    не получен (не CAP_ABSENT и не «потолка нет ниже цены»); CAP_UNKNOWN — пригодных проб нет или только отказы.
+    Дополнительно — число подавленных пилотом G2 проб выше принятой цены (CAP_MAY_HAVE_BEEN_MISSED).
+    30010 не выдумывается. Читаются все логи пробы пары за последние 6 ч (перезапуск)."""
     logs = sorted((ROOT / "logs").glob(f"probe_{symbol}_2*.jsonl"))
     if not logs:
         return {"status": "CAP_UNKNOWN", "reason": "нет лога пробы"}
     fresh = [p for p in logs if time.time() - p.stat().st_mtime < 6 * 3600] or logs[-1:]
-    accepted, rejected, skipped, best = 0, {}, None, None
+    sent, rejected, skipped, missed = [], {}, None, 0
     for path in fresh:
         with path.open(encoding="utf-8") as f:
             for line in f:
+                if '"check": "cap_suppressed"' in line:
+                    missed += bool(json.loads(line).get("cap_may_have_been_missed"))
+                    continue
                 if '"check": "cap_maker"' not in line:
                     continue
                 e = json.loads(line)
                 state = e.get("state", "")
                 if state == "ACCEPTED":
-                    accepted += 1  # заявка выше вероятного потолка принята — потолка на этой цене нет
-                    try:
-                        px = float((e.get("params") or {}).get("price") or 0)
-                    except ValueError:
-                        px = 0.0
-                    if best is None or px > best[0]:
-                        best = (px, e.get("rel_ms"))
+                    rel = e.get("rel_ms")
+                    sent.append(f"{(e.get('params') or {}).get('price')}"
+                                + (f" (T0{rel / 1000:+.0f} с)" if rel is not None else ""))
                 elif "30010" in state:
-                    return {"status": "CAP_FOUND", "reason": "30010 в логе пробы"}
+                    return {"status": "CAP_FOUND", "reason": "30010 в логе пробы", "may_have_been_missed": missed}
                 elif state.startswith(("skipped", "stop", "waiting")):
                     skipped = state
                 else:  # 10007, 30004 и т. п. о потолке ничего не говорят
                     code = state.split()[1] if state.startswith("ERR ") else state
                     rejected[code] = rejected.get(code, 0) + 1
-    if accepted:
-        when = f", T0{best[1] / 1000:+.0f} с" if best and best[1] is not None else ""
-        return {"status": "NO_CAP_OBSERVED", "bound": best[0] if best else None,
-                "reason": f"NO_CAP_OBSERVED_IN_PROBES: LIMIT_MAKER принят {accepted} раз без 30010; потолка нет ниже "
-                          f"{best[0]:g}{when} — не CAP_ABSENT"}
+    tail = f"; CAP_MAY_HAVE_BEEN_MISSED: {missed}" if missed else ""
+    if sent:
+        return {"status": "NO_CAP_OBSERVED", "sent": sent, "may_have_been_missed": missed,
+                "reason": f"NO_CAP_OBSERVED: для отправленных цен {', '.join(sent)} 30010 не получен — наблюдение, "
+                          f"не CAP_ABSENT{tail}"}
     why = skipped or (f"LIMIT_MAKER только отклонялся: {rejected}" if rejected else "LIMIT_MAKER после открытия не подавался")
-    return {"status": "CAP_UNKNOWN", "reason": why}
+    return {"status": "CAP_UNKNOWN", "reason": why + tail, "may_have_been_missed": missed}
 
 
 def code_version() -> str:

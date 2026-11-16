@@ -84,20 +84,62 @@ def extract(src: Path, dst: Path) -> None:
         print(f"{p.name}: строк {n}", flush=True)
 
 
+ACCOUNT: dict = {"main": {"found": 0, "run": 0, "skipped": {}, "errors": {}},
+                 "cap": {"found": 0, "run": 0, "skipped": {}, "errors": {}}}
+
+
+def file_sha(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def manifest(win: Path, cap_dir: Path | None) -> dict:
+    """Входы проверки: окна основной стратегии и полные записи CAP — имя → SHA-256 (16 знаков)."""
+    import p0_stress as ps
+    out = {"main": {p.name: file_sha(p) for p in ps.records(win)}}
+    if cap_dir is not None:
+        import cap_replay
+        import core.cap_breakout as cb
+        for mod in (cb, cap_replay):
+            mod.LOGS = cap_dir
+        out["cap"] = {p.name: file_sha(p) for p in cap_replay.frozen_records()}
+    return out
+
+
 def main_rows(win: Path) -> dict:
-    """Отпечатки строк основной стратегии по записям: путь REPLAY и путь PAPER (набор PAPER)."""
+    """Отпечатки строк основной стратегии по записям: путь REPLAY и путь PAPER (набор PAPER). Каждая найденная запись
+    учитывается: запущена, пропущена с причиной (нет открытия) или ошибка (повреждена) — без молчаливого пропуска."""
     import p0_stress as ps
     import paper_vs_replay as pvr
-    out = {}
-    for p in ps.records(win):
-        rec = ps.Rec(p)
-        if rec.t0 is None:
+    out, acc = {}, ACCOUNT["main"]
+    recs = ps.records(win)
+    acc["found"] = len(recs)
+    for p in recs:
+        sym = p.name.split("_")[1]
+        try:  # окна вырезает extract и пишет целиком: обрезанный gzip — повреждение (core.feed читает его молча)
+            with gzip.open(p, "rb") as f:
+                while f.read(1 << 20):
+                    pass
+        except (EOFError, OSError) as e:
+            acc["errors"][sym] = f"{p.name}: gzip не дочитан до конца ({type(e).__name__}: {e})"
             continue
-        _, rep = pvr.replay_path(p, ps.CFG)
-        pap = ps.Run(rec, rec.entries).rows.values()
+        try:
+            rec = ps.Rec(p)
+            if rec.t0 is None:
+                acc["skipped"][sym] = "в окне нет открытия"
+                continue
+            _, rep = pvr.replay_path(p, ps.CFG)
+            pap = ps.Run(rec, rec.entries).rows.values()
+        except Exception as e:  # noqa: BLE001 — повреждённая запись — ошибка проверки, не пропуск
+            acc["errors"][sym] = f"{p.name}: {type(e).__name__}: {e}"
+            continue
         rep = sorted(rep, key=lambda r: str(ps.key(r)))
         pap = sorted(pap, key=lambda r: str(ps.key(r)))
         out[rec.sym] = dict(replay=digest(rep), paper=digest(pap), rows=len(rep) + len(pap))
+    acc["run"] = len(out)
     return out
 
 
@@ -107,6 +149,9 @@ def cap_rows(cap_dir: Path) -> dict:
     import core.cap_breakout as cb
     for mod in (cb, cap_replay):
         mod.LOGS = cap_dir
+    if not cap_replay.frozen_records():  # пустая папка — 0 листингов; сравнение с эталоном покажет «нет в данных»
+        ACCOUNT["cap"]["found"] = 0
+        return {}
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "cap.json"
         argv = sys.argv
@@ -117,11 +162,18 @@ def cap_rows(cap_dir: Path) -> dict:
         finally:
             sys.argv = argv
         rows = json.loads(path.read_text(encoding="utf-8"))
+    ACCOUNT["cap"]["found"] = len(cap_replay.frozen_records())
     by = {}
     for r in rows:
         by.setdefault(r["symbol"], []).append(r)
-    return {s: dict(cap=digest(sorted(rs, key=lambda r: json.dumps(r, sort_keys=True, default=str))), rows=len(rs))
-            for s, rs in sorted(by.items())}
+    out = {s: dict(cap=digest(sorted(rs, key=lambda r: json.dumps(r, sort_keys=True, default=str))), rows=len(rs))
+           for s, rs in sorted(by.items())}
+    ACCOUNT["cap"]["run"] = len(out)
+    for f in cap_replay.frozen_records():
+        sym = f.name.split("_")[1]
+        if sym not in out:  # движок CAP не открыл ни одной ветки — пропуск с причиной, не молча
+            ACCOUNT["cap"]["skipped"][sym] = "строк CAP нет (снятие потолка в окне записи не наступило)"
+    return out
 
 
 CAP_KEYS = ("decision_ms", "entry_ms", "entry_px", "reason", "pnl_usdt", "exit_ms")
@@ -213,7 +265,14 @@ def stress(win: Path) -> list[str]:
     import p0_stress as ps
     bad = []
     for p in ps.records(win):
-        res = ps.run_record(p, set(ps.TESTS))
+        try:
+            with gzip.open(p, "rb") as f:
+                while f.read(1 << 20):
+                    pass
+            res = ps.run_record(p, set(ps.TESTS))
+        except Exception as e:  # noqa: BLE001 — повреждённая запись: тест не пройден, не пропущен
+            bad.append(f"{p.name.split('_')[1]}: запись не прочитана — gzip не дочитан или повреждён ({type(e).__name__}: {e})")
+            continue
         bad += [f"{p.name.split('_')[1]}: {n}" for n, r in res.items() if not n.startswith("_") and not r["pass"]]
         print(f"  {p.name.split('_')[1]}: тестов {max(len(res) - 1, 0)}", flush=True)
     return bad
@@ -257,25 +316,52 @@ def main() -> None:
         return
     started = time.time()
     win = Path(a.win)
+    golden = Path(a.golden)
+    if a.action == "check" and not a.cap_dir:
+        raise SystemExit("ОШИБКА: check без --cap-dir — причинность и эталон CAP BREAKOUT обязательны (решение 12.11)")
+    if a.action == "check" and not golden.is_file():
+        raise SystemExit(f"ОШИБКА: эталон {golden} недоступен — проверка невозможна")
+    for d in [win] + ([Path(a.cap_dir)] if a.cap_dir else []):
+        if not d.is_dir():
+            raise SystemExit(f"ОШИБКА: папка {d} не существует")
     main_now = main_rows(win)
     cap_now = cap_rows(Path(a.cap_dir)) if a.cap_dir else {}
-    if a.action == "check" and not a.cap_dir:
-        raise SystemExit("check: нужна --cap-dir (причинность и эталон CAP BREAKOUT обязательны, решение клиента 12.11)")
-    golden = Path(a.golden)
+    inputs = manifest(win, Path(a.cap_dir) if a.cap_dir else None)
     if a.action == "save":
         if not a.reason:
             raise SystemExit("save: нужна --reason")
         old = json.loads(golden.read_text(encoding="utf-8")) if golden.exists() else {}
         history = old.get("history", []) + [dict(at=time.strftime("%Y-%m-%d %H:%M"), code=code_label(), reason=a.reason)]
-        golden.write_text(json.dumps(dict(main=main_now, cap=cap_now or old.get("cap", {}), history=history),
-                                     ensure_ascii=False, indent=1), encoding="utf-8")
+        if ACCOUNT["main"]["errors"] or ACCOUNT["cap"]["errors"]:
+            raise SystemExit(f"save: есть ошибки входных данных — эталон не записан: {ACCOUNT}")
+        golden.write_text(json.dumps(dict(main=main_now, cap=cap_now or old.get("cap", {}), inputs=inputs,
+                                          history=history), ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"эталон записан: {golden} (основная {len(main_now)} записей, CAP {len(cap_now or old.get('cap', {}))})")
         return
-    gold = json.loads(golden.read_text(encoding="utf-8"))
+    try:
+        gold = json.loads(golden.read_text(encoding="utf-8"))
+        gold["main"], gold["cap"]
+    except (ValueError, KeyError) as e:
+        raise SystemExit(f"ОШИБКА: эталон {golden} повреждён ({type(e).__name__}: {e})")
     errors, warnings = compare("основная", main_now, gold["main"])
-    if cap_now:
-        e, w = compare("CAP", cap_now, gold.get("cap", {}))
-        errors, warnings = errors + e, warnings + w
+    e, w = compare("CAP", cap_now, gold.get("cap", {}))  # всегда: пустая папка CAP — ошибка, не тихий пропуск
+    errors, warnings = errors + e, warnings + w
+    for part in ("main", "cap"):
+        for sym, why in ACCOUNT[part]["errors"].items():
+            errors.append(f"{part} {sym}: запись не прочитана — {why}")
+        if ACCOUNT[part]["run"] == 0:
+            errors.append(f"{part}: 0 сравнений — проверка ничего не проверила")
+    gin = gold.get("inputs")
+    if gin is None:
+        warnings.append("в эталоне нет манифеста входов (SHA-256) — сверка версий входов невозможна до save")
+    else:
+        for part in ("main", "cap"):
+            for name, h in (gin.get(part) or {}).items():
+                now_h = (inputs.get(part) or {}).get(name)
+                if now_h is None:
+                    errors.append(f"вход {part} {name}: есть в манифесте эталона, нет в данных")
+                elif now_h != h:
+                    errors.append(f"вход {part} {name}: SHA-256 {now_h} ≠ эталона {h} — входные данные изменились")
     if not a.skip_stress:
         print("контролируемые тесты p0_stress:")
         errors += [f"тест не прошёл — {x}" for x in stress(win)]
@@ -288,6 +374,26 @@ def main() -> None:
         print(f"предупреждение: {w}")
     for e in errors:
         print(f"ОШИБКА: {e}")
+    for part, title in (("main", "основная"), ("cap", "CAP")):
+        acc = ACCOUNT[part]
+        gold_part = gold["main"] if part == "main" else gold.get("cap", {})
+        now_part = main_now if part == "main" else cap_now
+        bad = {x.split()[1].rstrip(":") for x in errors if x.startswith(("основная " if part == "main" else "CAP ",
+                                                                          f"{part} "))}
+        passed = sum(1 for s_ in now_part if s_ in gold_part and s_ not in bad)
+        print(f"{title}: найдено {acc['found']}, запущено {acc['run']}, пропущено {len(acc['skipped'])}"
+              + (f" ({acc['skipped']})" if acc["skipped"] else "")
+              + f", прошло {passed}, не прошло {len(bad)}, ошибок чтения {len(acc['errors'])}")
+    head = "?"
+    try:
+        import subprocess
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+                              cwd=Path(__file__).resolve().parent).stdout.strip() or "нет git"
+    except Exception:  # noqa: BLE001
+        pass
+    print(f"код {code_label()}; git {head}; эталон {golden.name}, последняя запись: "
+          f"{(gold.get('history') or [{}])[-1].get('at')}; входов в манифесте "
+          f"{sum(len(v) for v in (gold.get('inputs') or {}).values())}")
     print(f"\nрегрессия: основная {len(main_now)} записей, CAP {len(cap_now)} листингов, тесты "
           f"{'пропущены' if a.skip_stress else 'выполнены'}; {'НЕ ПРОЙДЕНА' if errors else 'пройдена'} "
           f"({time.time() - started:.0f} с)")

@@ -367,6 +367,14 @@ def report(rows: list[dict], metas: list[dict], latency: int, usdt: float, fee: 
     return ["\n".join(head), "\n".join(early), "\n".join(per)]
 
 
+def main_sample(rows: list[dict]) -> list[dict]:
+    """Основная оценочная выборка: без листингов с меткой core/data_marks (их строки остаются в --json и регрессии)."""
+    from core.data_marks import excluded, mark_line
+    for sym in sorted({r["symbol"] for r in rows if excluded(r["symbol"])}):
+        print(mark_line(sym))
+    return [r for r in rows if not excluded(r["symbol"])]
+
+
 def summary(rows: list[dict]) -> None:
     print("\nИтого (листинги без входа в сумму не входят; остаток — непроданное по bid, в сумму не входит):")
     print(f"  {'режим':<9} {'вариант':<19} {'профиль':<19} {'мс':>3} {'USDT':>4}  входов  +/−   сумма USDT  средний %"
@@ -464,10 +472,7 @@ def main() -> None:
     if texts:
         print("\n\n".join(texts))
     else:
-        from core.data_marks import excluded, mark_line
-        for sym in sorted({r["symbol"] for r in rows if excluded(r["symbol"])}):
-            print(mark_line(sym))  # строки остаются в --json и в регрессии; в итог не входят
-        summary([r for r in rows if not excluded(r["symbol"])])
+        summary(main_sample(rows))
     print(f"\n({len(files)} записей, {time.monotonic() - started:.0f} с)", file=sys.stderr)
     if args.json:
         Path(args.json).write_text(json.dumps(rows, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
