@@ -11,6 +11,28 @@ from time import perf_counter
 
 from .book import Book, ceil_step, depth_usdt, floor_step, vwap
 
+# Вариант (b) профиля глубокого стакана (решение клиента 13.11, A–E, п. 5.2): глубина bids в одном и том же диапазоне
+# считается один раз на состояние стакана для всех открытых позиций. ТЕСТОВАЯ ВЕРСИЯ: по умолчанию выключено,
+# включается только переменной окружения P0_DEPTH_MEMO=1 для сравнения до/после; в бою не активируется.
+# Ключ — сам объект списка уровней (Book.levels создаёт новый список при каждом изменении стакана, в том числе при
+# снимке и ресинхронизации, и не меняет его на месте) и точные границы lo/hi; функция та же — результат побитово тот же.
+import os as _os
+
+DEPTH_MEMO = _os.environ.get("P0_DEPTH_MEMO") == "1"
+_MEMO: dict = {"lv": None, "vals": {}}
+
+
+def depth_bids(levels, lo: float, hi: float) -> float:
+    if not DEPTH_MEMO:
+        return depth_usdt(levels, lo, hi)
+    if _MEMO["lv"] is not levels:
+        _MEMO["lv"], _MEMO["vals"] = levels, {}
+    key = (lo, hi)
+    v = _MEMO["vals"].get(key)
+    if v is None:
+        v = _MEMO["vals"][key] = depth_usdt(levels, lo, hi)
+    return v
+
 LOGS = Path(__file__).resolve().parent.parent.parent / "logs"
 
 ORDER_USDT = 10.0
@@ -545,11 +567,11 @@ class Sim:
         self.mfe, self.mae = max(self.mfe, plain), min(self.mae, plain)
         value = self.Q * bb
         if value > 0:
-            d07, d15 = depth_usdt(bids, bb * 0.993, bb), depth_usdt(bids, bb * 0.985, bb)
+            d07, d15 = depth_bids(bids, bb * 0.993, bb), depth_bids(bids, bb * 0.985, bb)
             self.min_d07, self.min_d15 = min(self.min_d07, d07 / value), min(self.min_d15, d15 / value)
         depth_hit = False
         if p.depth_x is not None:
-            low = depth_usdt(bids, bb * (1 - self.opts.depth_band), bb) < p.depth_x * value
+            low = depth_bids(bids, bb * (1 - self.opts.depth_band), bb) < p.depth_x * value
             self.depth_low_since = (self.depth_low_since or t) if low else None
             depth_hit = low and t - self.depth_low_since >= self.opts.depth_persist_ms
         last_trade = self.trades[-1][1] if self.trades else None
