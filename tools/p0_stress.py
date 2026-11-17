@@ -52,9 +52,9 @@ TESTS = ("delay", "snapshot", "gap", "late", "order", "future", "same")
 class Rec:
     """Окно записи: T0, строки (exchangeInfo, REST-снимки, WS-кадры) в порядке получения, сведения REPLAY."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, contract: bool = True):
         self.path, self.sym = path, path.name.split("_")[1]
-        self.t0, _, self.info_replay, self.times = load_open(path)
+        self.t0, _, self.info_replay, self.times = load_open(path, contract=contract)
         self.entries, self.infos = [], []
         if self.t0 is None:
             return

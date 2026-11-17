@@ -60,13 +60,45 @@ def api_closed(symbol: str, within_ms: int = 30_000) -> bool:
     return False
 
 
-def load_open(path: Path, before_ms: int = 60_000, after_ms: int = 120_000):
+HISTORICAL_MS = 24 * 3600 * 1000  # firstOpenTime раньше начала записи больше чем на сутки — пара давно торгуется
+
+
+class ListingContractError(ValueError):
+    """Запись не соответствует контракту REPLAY листинга (P0-REPLAY-SYNTHETIC-MISMATCH, решение клиента 16.11):
+    отказ с причиной вместо молчаливых «0 входов». code — HISTORICAL_FIRST_OPEN или LATE_START."""
+
+    def __init__(self, code: str, msg: str):
+        super().__init__(f"INVALID_FOR_LISTING_REPLAY ({code}): {msg}")
+        self.code = code
+
+
+def listing_contract(start_ms: int | None, first_open: int | None) -> tuple[str, str] | None:
+    """Контракт REPLAY листинга: запись начата до официального открытия (firstOpenTime ≥ первой строки записи), иначе
+    в ней нет начала открытия, а exchangeInfo, переданный движку заранее, переносит T0 в прошлое (BTCUSDT: 2017 год —
+    окно входа давно прошло, 0 входов). Нет firstOpenTime — T0 по OPEN_DETECTED, контракт не нарушен.
+    Возвращает (код, пояснение) или None."""
+    if not first_open or start_ms is None or first_open >= start_ms:
+        return None
+    gap = start_ms - first_open
+    when = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(first_open / 1000))
+    if gap > HISTORICAL_MS:
+        return ("HISTORICAL_FIRST_OPEN", f"firstOpenTime {when} — за {gap / 86_400_000:.0f} сут до начала записи: "
+                                         "пара уже торговалась, это не листинг")
+    return ("LATE_START", f"запись начата через {gap / 1000:.1f} с после firstOpenTime {when}: начала открытия "
+                          "в записи нет")
+
+
+def load_open(path: Path, before_ms: int = 60_000, after_ms: int = 120_000, contract: bool = True):
     """События вокруг открытия. T0 — официальное время открытия (firstOpenTime в exchangeInfo записи), нет его —
     OPEN_DETECTED записи. Окно — от T0 − before_ms до T0 + after_ms; exchangeInfo — последнее до T0 + 10 с.
     Время WS-кадров — с поправкой на остановки процесса записи (core.feed.frame_time).
+    Контракт листинга (listing_contract) проверяется по firstOpenTime, который получит движок; нарушение —
+    ListingContractError (contract=False — только для диагностики расхождения, tools/p0_synthetic_mismatch.py).
     Возвращает T0, события, exchangeInfo, сведения о времени."""
-    detected, first_open = None, None
+    detected, first_open, start = None, None, None
     for line in iter_lines(path):
+        if start is None:
+            start = line_t(line)
         if '"ch":"exchangeInfo"' in line and '"firstOpenTime"' in line:
             syms = (json.loads(line)["data"] or {}).get("symbols") or []
             if syms and syms[0].get("firstOpenTime"):
@@ -95,6 +127,9 @@ def load_open(path: Path, before_ms: int = 60_000, after_ms: int = 120_000):
             entries.append(json.loads(line))
     if first_open and not info.get("firstOpenTime"):
         info = dict(info, firstOpenTime=first_open)
+    broken = listing_contract(start, int(info["firstOpenTime"]) if info.get("firstOpenTime") else first_open)
+    if broken and contract:
+        raise ListingContractError(*broken)
     base = ws_base_lag(entries)
     stalled = [e for e in entries if frame_time(e, base) != e["t"]]
     events = sorted((ev + frame_meta(e) for e in entries for ev in events_of(e, base) if ev[0] <= hi),
@@ -106,7 +141,8 @@ def load_open(path: Path, before_ms: int = 60_000, after_ms: int = 120_000):
         else:
             spans.append([ft, ft])
     times = dict(exchange_open_ms=first_open, detected_rel_ms=detected - t0, stalled_frames=len(stalled),
-                 stall_max_ms=max((e["t"] - frame_time(e, base) for e in stalled), default=0), recon_spans=spans)
+                 stall_max_ms=max((e["t"] - frame_time(e, base) for e in stalled), default=0), recon_spans=spans,
+                 record_start_ms=start, contract=broken[0] if broken else "OK")
     return t0, events, info, times
 
 
@@ -130,7 +166,11 @@ def run_listing(path: Path, args) -> tuple[list[dict], dict]:
     if symbol in SKIP_SYMBOLS:
         meta["status"] = SKIP_SYMBOLS[symbol]
         return [], meta
-    open_ms, events, info, times = load_open(path)
+    try:
+        open_ms, events, info, times = load_open(path)
+    except ListingContractError as e:  # не листинг или поздний старт записи — отказ с причиной, не «0 входов»
+        meta["status"] = str(e)
+        return [], meta
     meta["times"] = times
     if open_ms is None or not events:
         meta["status"] = "открытия в записи нет"

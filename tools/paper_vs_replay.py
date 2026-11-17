@@ -18,7 +18,7 @@ from pathlib import Path
 
 from core.cap_breakout import MAIN_EARLY_PAPER, ORDER_USDT, MainEngine, Opts
 from core.feed import events_of, frame_meta, iter_lines
-from main_replay import load_open, usdt_records
+from main_replay import ListingContractError, load_open, usdt_records
 
 KEYS = ("decision_ms", "entry_ms", "entry_px", "reason", "pnl_usdt", "exit_ms")
 
@@ -88,10 +88,18 @@ def main() -> None:
     cfg = Namespace(latency=[50], usdt=[ORDER_USDT], sweep=False, main_early=MAIN_EARLY_PAPER)
     files = [Path(f) for f in a.files] + (usdt_records() if a.all_usdt else [])
     total = bad = 0
+    refused = 0
     for f in files:
-        n, d = compare(f, cfg)
+        try:
+            n, d = compare(f, cfg)
+        except ListingContractError as e:  # не листинг / поздний старт: отказ с причиной, не «0 входов»
+            print(f"{f.name}: ОТКАЗ — {e}")
+            refused += 1
+            continue
         total, bad = total + n, bad + d
-    print(f"\nИтого веток {total}, расхождений {bad}", file=sys.stderr)
+    print(f"\nИтого веток {total}, расхождений {bad}, отказов по контракту листинга {refused}", file=sys.stderr)
+    if refused:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

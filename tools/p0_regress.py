@@ -84,8 +84,8 @@ def extract(src: Path, dst: Path) -> None:
         print(f"{p.name}: строк {n}", flush=True)
 
 
-ACCOUNT: dict = {"main": {"found": 0, "run": 0, "skipped": {}, "errors": {}},
-                 "cap": {"found": 0, "run": 0, "skipped": {}, "errors": {}}}
+ACCOUNT: dict = {"main": {"found": 0, "run": 0, "skipped": {}, "errors": {}, "knowledge": {}},
+                 "cap": {"found": 0, "run": 0, "skipped": {}, "errors": {}, "no_release": {}}}
 
 
 def file_sha(p: Path) -> str:
@@ -132,7 +132,16 @@ def main_rows(win: Path) -> dict:
                 acc["skipped"][sym] = "в окне нет открытия"
                 continue
             _, rep = pvr.replay_path(p, ps.CFG)
-            pap = ps.Run(rec, rec.entries).rows.values()
+            run = ps.Run(rec, rec.entries)
+            pap = run.rows.values()
+            # время знания exchangeInfo (решение 16.11, п. 6.3): REPLAY получает параметры инструмента заранее — они
+            # обязаны совпасть с тем, что путь PAPER имел к старту веток, и T0 — тоже; иначе это заглядывание REPLAY
+            pinfo = run.eng.info or {}
+            diff = [k for k in ("firstOpenTime",) + ps.INFO_KEYS
+                    if str(rec.info_replay.get(k)) != str(pinfo.get(k))]
+            if run.eng.open_ms != rec.t0 or diff:
+                acc["knowledge"][sym] = (f"T0 REPLAY {rec.t0} / PAPER {run.eng.open_ms}; параметры, известные REPLAY "
+                                         f"заранее, отличаются: {diff or 'нет'}")
         except Exception as e:  # noqa: BLE001 — повреждённая запись — ошибка проверки, не пропуск
             acc["errors"][sym] = f"{p.name}: {type(e).__name__}: {e}"
             continue
@@ -171,9 +180,41 @@ def cap_rows(cap_dir: Path) -> dict:
     ACCOUNT["cap"]["run"] = len(out)
     for f in cap_replay.frozen_records():
         sym = f.name.split("_")[1]
-        if sym not in out:  # движок CAP не открыл ни одной ветки — пропуск с причиной, не молча
-            ACCOUNT["cap"]["skipped"][sym] = "строк CAP нет (снятие потолка в окне записи не наступило)"
+        if sym not in out:  # движок CAP не открыл ни одной ветки — отрицательный оракул, не пропуск (решение 16.11, п. 7)
+            ACCOUNT["cap"]["no_release"][sym] = no_release_oracle(f)
     return out
+
+
+def no_release_oracle(path: Path) -> dict:
+    """EXPECTED_NO_RELEASE_VERIFIED (решение клиента 16.11, п. 7): у замороженного листинга без строк CAP проверяется, что
+    причинный прогон (cap_replay.run_causal, конфигурация PAPER) по записанному потоку (1) не подтвердил снятие потолка,
+    (2) не открыл ни одного входа, которому нужно подтверждённое снятие, (3) даёт исход по правилу PAPER
+    NO_RELEASE_OBSERVED_WITHIN_WINDOW, и фиксирует фактическую границу окна (T0 + 30 мин или конец записи, что раньше).
+    Это не PASS полного теста снятия: снятия в записи нет, проверено только отсутствие ложного снятия и ложного входа."""
+    from argparse import Namespace
+
+    import cap_replay
+    import core.cap_breakout as cb
+    from core.cap_breakout import EARLY_USDT, ORDER_USDT, Opts
+    sym = path.name.split("_")[1]
+    found = cb.find_cap(sym) or ((cb.KNOWN_CAPS[sym], "") if sym in cb.KNOWN_CAPS else None)
+    cfg = Namespace(modes=["FAST", "CONFIRMED", "EARLY"], early={}, early_sweep=False, latency=[50],
+                    usdt=[ORDER_USDT], early_usdt=list(EARLY_USDT))
+    from core.feed import iter_lines, line_t
+    eng, open_ms = cap_replay.run_causal(path, cfg, Opts(), found[0])
+    if eng is None:
+        return dict(ok=False, why="в записи нет открытия")
+    rec_end = None
+    for line in iter_lines(path):
+        rec_end = line_t(line)
+    entries = sum(1 for s in eng.sims if getattr(s, "entry_ms", None))
+    status = "RELEASE_OBSERVED" if eng.release is not None else "NO_RELEASE_OBSERVED_WITHIN_WINDOW"
+    until = min(open_ms + cap_replay.RELEASE_WAIT_MS, rec_end or open_ms)
+    ok = eng.release is None and entries == 0 and status == "NO_RELEASE_OBSERVED_WITHIN_WINDOW"
+    return dict(ok=ok, status=status, release_ms=eng.release, entries=entries, sims=len(eng.sims), cap=found[0],
+                t0=open_ms, window_until_rel_s=round((until - open_ms) / 1000, 1),
+                window_full_30min=bool(rec_end and rec_end >= open_ms + cap_replay.RELEASE_WAIT_MS),
+                why=None if ok else f"снятие {eng.release}, входов {entries}")
 
 
 CAP_KEYS = ("decision_ms", "entry_ms", "entry_px", "reason", "pnl_usdt", "exit_ms")
@@ -334,8 +375,13 @@ def main() -> None:
         history = old.get("history", []) + [dict(at=time.strftime("%Y-%m-%d %H:%M"), code=code_label(), reason=a.reason)]
         if ACCOUNT["main"]["errors"] or ACCOUNT["cap"]["errors"]:
             raise SystemExit(f"save: есть ошибки входных данных — эталон не записан: {ACCOUNT}")
-        golden.write_text(json.dumps(dict(main=main_now, cap=cap_now or old.get("cap", {}), inputs=inputs,
-                                          history=history), ensure_ascii=False, indent=1), encoding="utf-8")
+        bad_nr = {s: r for s, r in ACCOUNT["cap"]["no_release"].items() if not r["ok"]}
+        if bad_nr:
+            raise SystemExit(f"save: оракул отсутствия снятия не прошёл — эталон не записан: {bad_nr}")
+        nr = sorted(ACCOUNT["cap"]["no_release"]) if cap_now else old.get("cap_expected_no_release", [])
+        golden.write_text(json.dumps(dict(main=main_now, cap=cap_now or old.get("cap", {}), cap_expected_no_release=nr,
+                                          inputs=inputs, history=history), ensure_ascii=False, indent=1),
+                          encoding="utf-8")
         print(f"эталон записан: {golden} (основная {len(main_now)} записей, CAP {len(cap_now or old.get('cap', {}))})")
         return
     try:
@@ -346,6 +392,19 @@ def main() -> None:
     errors, warnings = compare("основная", main_now, gold["main"])
     e, w = compare("CAP", cap_now, gold.get("cap", {}))  # всегда: пустая папка CAP — ошибка, не тихий пропуск
     errors, warnings = errors + e, warnings + w
+    for sym, why in ACCOUNT["main"]["knowledge"].items():
+        errors.append(f"основная {sym}: время знания exchangeInfo — {why}")
+    exp_nr, nr = set(gold.get("cap_expected_no_release") or []), ACCOUNT["cap"]["no_release"]
+    for sym, r in nr.items():  # решение 16.11, п. 7: EXPECTED_NO_RELEASE_VERIFIED — не PASS и не тихий пропуск
+        if not r["ok"]:
+            errors.append(f"CAP {sym}: оракул отсутствия снятия не прошёл — {r['why']}")
+        elif sym not in exp_nr:
+            errors.append(f"CAP {sym}: строк CAP нет, а в эталоне листинг не объявлен ожидаемым без снятия "
+                          "(cap_expected_no_release) — набор меняется только через save с причиной")
+    if a.cap_dir and cap_now:
+        for sym in sorted(exp_nr - set(nr)):
+            errors.append(f"CAP {sym}: в эталоне объявлен ожидаемым без снятия, но оракул не выполнен (есть строки CAP "
+                          "или нет записи)")
     for part in ("main", "cap"):
         for sym, why in ACCOUNT[part]["errors"].items():
             errors.append(f"{part} {sym}: запись не прочитана — {why}")
@@ -383,7 +442,12 @@ def main() -> None:
         passed = sum(1 for s_ in now_part if s_ in gold_part and s_ not in bad)
         print(f"{title}: найдено {acc['found']}, запущено {acc['run']}, пропущено {len(acc['skipped'])}"
               + (f" ({acc['skipped']})" if acc["skipped"] else "")
-              + f", прошло {passed}, не прошло {len(bad)}, ошибок чтения {len(acc['errors'])}")
+              + f", прошло {passed}, не прошло {len(bad)}, ошибок чтения {len(acc['errors'])}"
+              + ("" if part == "main" else
+                 f", EXPECTED_NO_RELEASE_VERIFIED {sum(r['ok'] for r in nr.values())}"
+                 + "".join(f"; {s}: {r['status']}, снятие {r['release_ms']}, входов {r['entries']}, окно до T0+"
+                           f"{r['window_until_rel_s']} с{' (полные 30 мин)' if r['window_full_30min'] else ' (конец записи)'}"
+                           for s, r in sorted(nr.items()) if r['ok'])))
     head = "?"
     try:
         import subprocess

@@ -12,6 +12,7 @@ REPLAY по его записи не знает, когда те же кадры
 """
 
 DATA_AVAILABILITY_UNCONFIRMED = "DATA_AVAILABILITY_UNCONFIRMED"
+SYNTHETIC_FIXTURE = "SYNTHETIC_FIXTURE"  # не листинг: тестовый поток (P0-REPLAY-SYNTHETIC-MISMATCH, решение клиента 16.11)
 
 MARKS: dict[str, dict] = {
     "VLXUSDT": {
@@ -25,6 +26,15 @@ MARKS: dict[str, dict] = {
                  "paper_VLXUSDT_20261106_050543.jsonl (START_PAPER, OPEN, START, 24 NO_ENTRY, SUMMARY)",
                  "paper_VLXUSDT_console.txt", "probe_VLXUSDT_20261106_050543.jsonl"],
     },
+    "BTCUSDT": {
+        "mark": SYNTHETIC_FIXTURE,
+        "task": "P0-REPLAY-SYNTHETIC-MISMATCH (решение клиента 16.11) — только тест инструментов и производительности",
+        "since": "2026-11-16",
+        "reason": "BTCUSDT не листинг: журнал PAPER, запущенного на давно торгуемой паре (firstOpenTime 2017-09-30); "
+                  "исходный журнал — INVALID_FOR_LISTING_REPLAY, валидная синтетика строится "
+                  "tools/p0_synthetic_mismatch.py make-valid; ни в одну выборку и рейтинг не входит",
+        "kept": ["p0test/logs/paperrec_BTCUSDT_20261112_110830.jsonl.gz (SHA-256 4a078b63…ddb906)"],
+    },
 }
 
 
@@ -35,6 +45,8 @@ def mark_of(symbol: str) -> dict | None:
 def excluded(symbol: str) -> bool:
     """Исключать ли листинг из основной оценочной выборки."""
     m = MARKS.get(symbol)
+    # только DATA_AVAILABILITY_UNCONFIRMED: группы исключения не смешиваются (решение 16.11, A.4); SYNTHETIC_FIXTURE —
+    # информационная метка (BTCUSDT не rec_* и в выборки не попадает; отдельная группа — в манифесте eligibility)
     return bool(m and m["mark"] == DATA_AVAILABILITY_UNCONFIRMED)
 
 
