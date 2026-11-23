@@ -63,7 +63,7 @@ def fixture(path: Path) -> dict:
         t = line_t(line)
         start = t if start is None else start
         if '"ch":"exchangeInfo"' in line:
-            s = ((json.loads(line).get("data") or {}).get("symbols") or [{}])[0] or {}
+            s = (((d := json.loads(line).get("data")) and isinstance(d, dict) and d.get("symbols")) or [{}])[0] or {}
             if s.get("firstOpenTime"):
                 first_open = int(s["firstOpenTime"])
         elif detected is None and '"OPEN_DETECTED"' in line:
@@ -92,35 +92,47 @@ def cmd_fixture(a) -> None:
 def state(eng: MainEngine) -> dict:
     b = eng.book
     return {"open_ms": eng.open_ms, "release": eng.release, "book_valid": b.valid, "book_version": b.version,
-            "sims": tuple(ps.sim_state(s) for s in eng.sims)}
+            "sims": tuple(ps.sim_state(s) for s in eng.sims), "t0_state": eng.t0_state}
 
 
-def replay_steps(path: Path):
-    t0, events, info, _ = load_open(path, contract=False)
-    eng = MainEngine(ps.CFG, Opts(), t0, info)
-    know = (info or {}).get("firstOpenTime")
-    for t, kind, data, recv, exch in events:
-        eng.on_event(t, kind, data, recv, exch)
-        yield (t, kind), state(eng), know
+def replay_steps(path: Path, legacy: bool = False):
+    """Путь REPLAY: события по времени, версии exchangeInfo — в момент получения (main_replay.feed_causal).
+    legacy — прежний REPLAY до 19.11: exchangeInfo (последний до T0 + 10 с) передан движку заранее (только для
+    отрицательного оракула: он обязан показать расхождение на событии 0)."""
+    t0, events, info, times = load_open(path, contract=False)
+    if legacy:
+        eng = MainEngine(ps.CFG, Opts(), None, info)  # знание справочника до потока — как было до 19.11
+        for ev in events:
+            eng.on_event(*ev)
+            yield (ev[0], ev[1]), state(eng), (info or {}).get("firstOpenTime")
+        return
+    eng = MainEngine(ps.CFG, Opts(), None, {}, join_ms=times["record_start_ms"])
+    infos = times["infos"]
+    for t, k, i in sorted([(t, 0, i) for i, (t, _) in enumerate(infos)] + [(ev[0], 1, j) for j, ev in enumerate(events)]):
+        if k == 0:
+            eng.on_info(t, infos[i][1], "rest")
+            continue
+        eng.on_event(*events[i])
+        yield (t, events[i][1]), state(eng), (eng.info or {}).get("firstOpenTime")
 
 
 def paper_steps(path: Path):
     rec = ps.Rec(path, contract=False)
-    eng = MainEngine(ps.CFG, Opts(), None, {})
+    eng = MainEngine(ps.CFG, Opts(), None, {}, join_ms=rec.t0 - ps.BEFORE_MS)
     for e in rec.entries:
         data = e.get("data")
         if e.get("ch") == "exchangeInfo":
             syms = data.get("symbols") if isinstance(data, dict) else None
-            if syms and syms[0] and eng.release is None:
-                eng.info = syms[0]
+            if syms and syms[0]:
+                eng.on_info(e["t"], syms[0], "rest")
             continue
         for t, kind, ev in events_of(e):
             eng.on_event(t, kind, ev, *frame_meta(e))
             yield (t, kind), state(eng), (eng.info or {}).get("firstOpenTime")
 
 
-def first_divergence(path: Path) -> dict:
-    rp, pp = replay_steps(path), paper_steps(path)
+def first_divergence(path: Path, legacy: bool = False) -> dict:
+    rp, pp = replay_steps(path, legacy), paper_steps(path)
     i = 0
     sentinel = object()
     for r, p in itertools.zip_longest(rp, pp, fillvalue=sentinel):
@@ -142,7 +154,7 @@ def first_divergence(path: Path) -> dict:
 
 def cmd_diverge(a) -> None:
     for f in a.files:
-        d = first_divergence(Path(f))
+        d = first_divergence(Path(f), a.legacy)
         print(f"{Path(f).name}: {json.dumps(d, ensure_ascii=False, default=str)}")
 
 
@@ -257,6 +269,8 @@ def main() -> None:
     for name in ("fixture", "diverge", "compare"):
         s = sub.add_parser(name)
         s.add_argument("files", nargs="+")
+        if name == "diverge":
+            s.add_argument("--legacy", action="store_true", help="REPLAY до 19.11 (exchangeInfo заранее) — для оракула")
     s = sub.add_parser("knowledge")
     s.add_argument("files", nargs="*")
     s.add_argument("--all-usdt", action="store_true")

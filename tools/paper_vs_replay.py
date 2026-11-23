@@ -18,21 +18,24 @@ from pathlib import Path
 
 from core.cap_breakout import MAIN_EARLY_PAPER, ORDER_USDT, MainEngine, Opts
 from core.feed import events_of, frame_meta, iter_lines
-from main_replay import ListingContractError, load_open, usdt_records
+from main_replay import ListingContractError, feed_causal, load_open, usdt_records
 
 KEYS = ("decision_ms", "entry_ms", "entry_px", "reason", "pnl_usdt", "exit_ms")
 
 
 def paper_path(path: Path, cfg, t0: int, after_ms: int = 120_000) -> list[dict]:
-    """Путь PAPER: строки записи в порядке получения, без поправок времени, T0 — из exchangeInfo в потоке."""
-    eng = MainEngine(cfg, Opts(), None, {})
+    """Путь PAPER: строки записи в порядке получения, без поправок времени, T0 — из exchangeInfo в потоке; наблюдение
+    начинается с первой строки записи (join_ms)."""
+    eng = None
     for line in iter_lines(path):
         e = json.loads(line)
+        if eng is None:
+            eng = MainEngine(cfg, Opts(), None, {}, join_ms=e["t"])
         data = e.get("data")
         if e.get("ch") == "exchangeInfo" and isinstance(data, dict):
             info = (data.get("symbols") or [{}])[0]
-            if info and eng.release is None:
-                eng.info = info
+            if info:
+                eng.on_info(e["t"], info, "rest")
             continue
         for t, kind, ev in events_of(e):
             eng.on_event(t, kind, ev, *frame_meta(e))
@@ -42,13 +45,23 @@ def paper_path(path: Path, cfg, t0: int, after_ms: int = 120_000) -> list[dict]:
     return eng.rows(path.name.split("_")[1])
 
 
+def replay_engine(path: Path, cfg, cut: int | None = None, info_hook=None):
+    """Путь REPLAY без завершения веток: (T0, движок, события). cut — остановиться после всех событий и версий
+    справочника с временем ≤ cut; info_hook(infos) → infos — подмена версий справочника (проверка неизменности
+    префикса по метаданным, p0_stress meta). Оба параметра — только для проверок; replay_path их не задаёт."""
+    t0, events, info, times = load_open(path)
+    if t0 is None:
+        return None, None, []
+    infos = info_hook(times["infos"]) if info_hook else times["infos"]
+    eng = MainEngine(cfg, Opts(), None, {}, join_ms=times["record_start_ms"])
+    feed_causal(eng, events, infos, until=cut)
+    return t0, eng, events
+
+
 def replay_path(path: Path, cfg) -> tuple[int | None, list[dict]]:
-    t0, events, info, _ = load_open(path)
+    t0, eng, events = replay_engine(path, cfg)
     if t0 is None:
         return None, []
-    eng = MainEngine(cfg, Opts(), t0, info)
-    for t, kind, data, recv, exch in events:
-        eng.on_event(t, kind, data, recv, exch)
     eng.finish(events[-1][0])
     return t0, eng.rows(path.name.split("_")[1])
 

@@ -53,7 +53,7 @@ def extract(src: Path, dst: Path) -> None:
             try:
                 for line in f:
                     if '"ch":"exchangeInfo"' in line and '"firstOpenTime"' in line:
-                        syms = (json.loads(line)["data"] or {}).get("symbols") or []
+                        syms = ((d := json.loads(line).get("data")) and isinstance(d, dict) and d.get("symbols")) or []
                         if syms and syms[0].get("firstOpenTime"):
                             first_open = int(syms[0]["firstOpenTime"])
                     elif '"OPEN_DETECTED"' in line:

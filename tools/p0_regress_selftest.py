@@ -14,7 +14,9 @@
                                         → FAIL, «INVALID_FOR_LISTING_REPLAY (HISTORICAL_FIRST_OPEN)», не «0 входов»
   N10b запись начата через 5 с после firstOpenTime → FAIL, «INVALID_FOR_LISTING_REPLAY (LATE_START)»
   N11 отрицательный оракул P0-REPLAY-SYNTHETIC-MISMATCH: на фикстуре N10a с отключённым контрактом
-      p0_synthetic_mismatch diverge обязан найти первое расхождение СОСТОЯНИЯ (open_ms) на событии 0
+      p0_synthetic_mismatch diverge --legacy (REPLAY до 19.11, справочник заранее) обязан найти первое расхождение
+      СОСТОЯНИЯ (open_ms, t0_state) на событии 0
+  N13 Time Guard (решение 19.11): на той же фикстуре причинный REPLAY и PAPER не расходятся (оба LATE_JOIN, веток нет)
   N12 замороженный листинг без снятия (KNTQ), не объявленный в эталоне ожидаемым без снятия
                                         → FAIL, «не объявлен ожидаемым без снятия» (решение 16.11, п. 7)
 Положительный контроль — обычный полный check (отдельно, ~8 мин): должен дать код 0.
@@ -137,16 +139,19 @@ def main() -> None:
             report.append({"case": name, "exit_code": code, "expected": must, "result": "PASS" if ok else "FAIL",
                            "last_line": last[0][:300]})
             print(f"{'PASS' if ok else 'FAIL'}  {name}: код {code}; {last[0][:160]}", flush=True)
-        r = subprocess.run([sys.executable, str(HERE / "p0_synthetic_mismatch.py"), "diverge",
-                            str(hist / "rec_SYNTHTESTUSDT_20261116_000000.jsonl.gz")], capture_output=True, text=True,
-                           cwd=HERE.parent, timeout=600)
-        out11 = r.stdout + r.stderr
-        must = ['"index": 0', '"where": "СОСТОЯНИЕ"', '"fields": ["open_ms"]']
-        ok = r.returncode == 0 and all(m in out11 for m in must)
-        fails += not ok
-        report.append({"case": "N11 оракул первого расхождения", "exit_code": r.returncode, "expected": must,
-                       "result": "PASS" if ok else "FAIL", "last_line": out11.strip()[-300:]})
-        print(f"{'PASS' if ok else 'FAIL'}  N11 оракул первого расхождения: {out11.strip()[-200:]}", flush=True)
+        fx = str(hist / "rec_SYNTHTESTUSDT_20261116_000000.jsonl.gz")
+        for case, extra, must in (
+                ("N11 оракул первого расхождения (прежний REPLAY)", ["--legacy"],
+                 ['"index": 0', '"where": "СОСТОЯНИЕ"', '"fields": ["open_ms", "t0_state"]']),
+                ("N13 Time Guard: причинный REPLAY = PAPER на не листинге", [], ['"where": null'])):
+            r = subprocess.run([sys.executable, str(HERE / "p0_synthetic_mismatch.py"), "diverge", fx, *extra],
+                               capture_output=True, text=True, cwd=HERE.parent, timeout=600)
+            o = r.stdout + r.stderr
+            ok = r.returncode == 0 and all(m in o for m in must)
+            fails += not ok
+            report.append({"case": case, "exit_code": r.returncode, "expected": must,
+                           "result": "PASS" if ok else "FAIL", "last_line": o.strip()[-300:]})
+            print(f"{'PASS' if ok else 'FAIL'}  {case}: {o.strip()[-200:]}", flush=True)
     out = HERE.parent / "logs" / f"p0_regress_selftest_{time.strftime('%Y%m%d')}.json"
     out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"\nотрицательных случаев {len(report)}, не прошли {fails}; протокол {out}")

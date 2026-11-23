@@ -72,7 +72,7 @@ def open_time(path: Path) -> int | None:
     first_open = None
     for line in iter_lines(path):
         if '"ch":"exchangeInfo"' in line and '"firstOpenTime"' in line:
-            syms = (json.loads(line)["data"] or {}).get("symbols") or []
+            syms = ((d := json.loads(line).get("data")) and isinstance(d, dict) and d.get("symbols")) or []
             if syms and syms[0].get("firstOpenTime"):
                 first_open = int(syms[0]["firstOpenTime"])
         elif '"OPEN_DETECTED"' in line:
@@ -86,7 +86,7 @@ def stream(path: Path, open_ms: int):
     и события движка (t, kind, data) начиная с T0. Без сортировки и без знания будущего."""
     for line in iter_lines(path):
         if '"ch":"exchangeInfo"' in line:
-            syms = (json.loads(line)["data"] or {}).get("symbols") or []
+            syms = ((d := json.loads(line).get("data")) and isinstance(d, dict) and d.get("symbols")) or []
             if syms:
                 yield "info", line_t(line), syms[0]
             continue

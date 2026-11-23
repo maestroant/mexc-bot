@@ -47,6 +47,7 @@ from notify import notify
 from probe_listing import ROOT, Client, load_dotenv
 
 LATENCY_MS = 50  # задержка ордера в модели — как в основном прогоне REPLAY
+JOIN_MARGIN_MS = 250  # Time Guard: запас на погрешность поправки часов при сравнении firstOpenTime со стартом (19.11)
 JOURNAL_BEFORE_MS, JOURNAL_AFTER_MS = 120_000, 300_000  # журнал кадров PAPER: T0 − 2 мин … T0 + 5 мин
 CAP_TAIL_MS = 120_000  # замороженный листинг: журнал ещё 120 с после завершения всех веток CAP BREAKOUT (клиент 11.11)
 LOOP_TICK_MS, LOOP_LAG_MS, SLOW_FRAME_MS = 10, 20, 20  # контроль цикла событий и медленных кадров (в журнал)
@@ -165,7 +166,10 @@ class Paper:
         self.cap_checked = False  # потолка нет и ждать его больше не нужно
         self.cap_status: dict = {}  # NO_CAP_OBSERVED / CAP_UNKNOWN и причина (решение клиента 12.11, C4)
         # основная стратегия ведёт стакан с запуска, T0 — по модели MainEngine; cap — CAP BREAKOUT, когда известен потолок
-        self.engines: dict[str, CapEngine] = {"main": MainEngine(self.main_cfg, Opts(), None, {})}
+        # наблюдение — с запуска процесса (join_ms): firstOpenTime раньше него — LATE_JOIN, веток нет (решение 19.11)
+        self.engines: dict[str, CapEngine] = {"main": MainEngine(self.main_cfg, Opts(), None, {},
+                                                                 join_ms=self.started_ms, join_margin_ms=JOIN_MARGIN_MS)}
+        self.t0_seen = 0  # сколько переходов состояния T0 уже записано в журнал
         self.states: dict[str, list[str]] = {}
         self.done: dict[str, bool] = {}
         self.proc_ms: list[float] = []
@@ -355,6 +359,20 @@ class Paper:
         return dict(versions=len(common), a_minus_b_p50_ms=pct(diffs, 0.5), a_minus_b_p01_ms=pct(diffs, 0.01),
                     a_minus_b_p99_ms=pct(diffs, 0.99), first_frame_after_t0_ms=first)
 
+    def t0_note(self) -> None:
+        """Новые переходы состояния T0 основного движка — в журнал (T0_STATE) и лог; LATE_JOIN — завершение без веток
+        (решение клиента 19.11): процесс запущен после открытия, окно открытия не наблюдалось, новых входов нет."""
+        main = self.engines["main"]
+        for rec in main.t0_log[self.t0_seen:]:
+            self.write("T0_STATE", known_at=rec.get("t"), **{k: v for k, v in rec.items() if k != "t"},
+                       first_msg_ms=main.first_msg_ms, started_ms=self.started_ms,
+                       clock_offset_ms=getattr(self.client, "time_offset_ms", None))
+            self.jevent("T0_STATE", t=rec.get("t") or self.feed.t(), **{k: v for k, v in rec.items() if k != "t"})
+            self.log(f"T0: {rec['state']} — {rec['why']}")
+        self.t0_seen = len(main.t0_log)
+        if main.t0_state == MainEngine.LATE_JOIN and not self.stop.is_set():
+            self.finish("late_join")
+
     # --- поток ---
     def on_entry(self, entry: dict) -> None:
         s0 = time.perf_counter()
@@ -364,10 +382,15 @@ class Paper:
         self.note_frame(entry)
         data = entry.get("data")
         if entry["ch"] == "exchangeInfo" and isinstance(data, dict):
-            self.info = (data.get("symbols") or [{}])[0] or self.info
-            for eng in self.engines.values():
-                if eng.release is None:
+            fresh = (data.get("symbols") or [{}])[0]
+            self.info = fresh or self.info
+            for name, eng in self.engines.items():
+                if isinstance(eng, MainEngine):
+                    if fresh:  # версия справочника — в момент получения ответа (known_at = время строки)
+                        eng.on_info(entry["t"], fresh, "rest")
+                elif eng.release is None:
                     eng.info = self.info  # шаги цены, полоса и комиссии — по последнему exchangeInfo до старта веток
+            self.t0_note()
             self.last_end = time.perf_counter()
             return
         if isinstance(data, dict) and data.get("sendTime"):

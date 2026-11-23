@@ -46,7 +46,8 @@ FUTURE_CUTS = 8
 DECISION_KEYS = ("decision_ms", "entry_ms", "entry_px")
 EXIT_KEYS = ("reason", "exit_ms", "pnl_usdt")
 INFO_KEYS = ("quotePrecision", "baseAssetPrecision", "filters", "takerCommission", "makerCommission")
-TESTS = ("delay", "snapshot", "gap", "late", "order", "future", "same")
+TESTS = ("delay", "snapshot", "gap", "late", "order", "future", "meta", "same")
+META_CUTS_MS = (-30_000, 500, 5_000)  # моменты C относительно T0 для проверки метаданных
 
 
 class Rec:
@@ -66,7 +67,7 @@ class Rec:
                 break
             is_info = '"ch":"exchangeInfo"' in line
             if is_info:
-                syms = (json.loads(line).get("data") or {}).get("symbols") or []
+                syms = ((d := json.loads(line).get("data")) and isinstance(d, dict) and d.get("symbols")) or []
                 if syms and syms[0]:
                     self.infos.append((t, syms[0]))
             if t < lo:
@@ -102,7 +103,8 @@ class Run:
     first_valid / invalid — когда стакан стал действительным и интервалы [a, b) недействительного после этого."""
 
     def __init__(self, rec: Rec, entries: list[dict], until: int | None = None, cuts=(), timeline: bool = False):
-        eng = MainEngine(CFG, Opts(), None, {})
+        # PAPER, запущенный за BEFORE_MS до T0: наблюдение с начала окна (Rec кладёт туда последний exchangeInfo до окна)
+        eng = MainEngine(CFG, Opts(), None, {}, join_ms=rec.t0 - BEFORE_MS)
         self.fp, self.tl, self.at_cut = {}, [], {}
         self.first_valid, self.invalid = None, []
         self.snap_jumps = []  # REST-снимок новее стакана из diff-ов (WS отстаёт от REST): (t от T0, версий вперёд)
@@ -118,8 +120,8 @@ class Run:
             data = e.get("data")
             if e.get("ch") == "exchangeInfo":
                 syms = data.get("symbols") if isinstance(data, dict) else None
-                if syms and syms[0] and eng.release is None:
-                    eng.info = syms[0]
+                if syms and syms[0]:
+                    eng.on_info(t, syms[0], "rest")
                 continue
             b = eng.book
             was = b.valid, b.version
@@ -347,6 +349,66 @@ def t_future(rec, base, out):
                          stalled_frames=(rec.times or {}).get("stalled_frames", 0))
 
 
+def mutate_info(i: dict) -> dict:
+    """Искажённая версия exchangeInfo: другой firstOpenTime (+1 ч), комиссия, точность цены и статус."""
+    d = dict(i)
+    if d.get("firstOpenTime"):
+        d["firstOpenTime"] = int(d["firstOpenTime"]) + 3_600_000
+    d["takerCommission"], d["makerCommission"] = "0.01", "0.01"
+    d["quotePrecision"] = int(d.get("quotePrecision") or 8) + 1
+    d["status"] = "2"
+    return d
+
+
+def legacy_preseed(t0: int):
+    """Подмена main_replay.feed_causal прежним поведением REPLAY до 19.11 (справочник — последний до T0 + 10 с — отдан
+    движку до первого события) — для обратного контроля теста meta через ту же точку входа."""
+    def feed(engine, events, infos, until=None):
+        pre = next((i for t, i in reversed(infos) if t <= t0 + 10_000), None)
+        if pre:
+            engine.on_info(None, pre, "legacy-preseed")
+        for ev in events:
+            if until is not None and ev[0] > until:
+                break
+            engine.on_event(*ev)
+    return feed
+
+
+def t_meta(rec, base, out):
+    """Неизменность префикса по метаданным (решение клиента 19.11, п. 2.3): все версии exchangeInfo, полученные после
+    момента C, искажены — состояние движка на C (T0, старт веток, стакан, все ветки) обязано совпасть с неискажённым
+    прогоном. REPLAY — через рабочую точку входа (paper_vs_replay.replay_engine → main_replay.feed_causal, её же
+    использует main_replay.run_listing); PAPER — путь p0_stress.Run. Обратный контроль: та же точка входа с подменой
+    feed_causal прежней предзагрузкой справочника обязана дать отличия (legacy_replay_violations > 0) — иначе тест
+    не ловит знание справочника из будущего. Метаданные CAP (KNOWN_CAPS, потолок) — вне этого теста (пункты 2–3)."""
+    from unittest import mock
+    t0 = rec.t0
+    cuts = [t0 + c for c in META_CUTS_MS]
+    paper_base = Run(rec, rec.entries, cuts=cuts)
+    rep_bad, pap_bad, legacy_bad = [], [], []
+    nver = 0
+    for c in cuts:
+        def hook(infos, c=c):
+            return [(t, mutate_info(i) if t > c else i) for t, i in infos]
+        _, e1, _ = paper_vs_replay.replay_engine(rec.path, CFG, cut=c)
+        _, e2, _ = paper_vs_replay.replay_engine(rec.path, CFG, cut=c, info_hook=hook)
+        nver = len(e1.info_versions)
+        if eng_state(e1) != eng_state(e2):
+            rep_bad.append(c - t0)
+        ents = [dict(e, data=dict(e["data"], symbols=[mutate_info(e["data"]["symbols"][0])]))
+                if e.get("ch") == "exchangeInfo" and e["t"] > c and (e.get("data") or {}).get("symbols") else e
+                for e in rec.entries]
+        if Run(rec, ents, cuts=[c]).at_cut[c] != paper_base.at_cut[c]:
+            pap_bad.append(c - t0)
+        with mock.patch.object(paper_vs_replay, "feed_causal", legacy_preseed(t0)):
+            _, l1, _ = paper_vs_replay.replay_engine(rec.path, CFG, cut=c)
+            _, l2, _ = paper_vs_replay.replay_engine(rec.path, CFG, cut=c, info_hook=hook)
+        if eng_state(l1) != eng_state(l2):
+            legacy_bad.append(c - t0)
+    out["meta"] = dict(cuts=len(cuts), versions_known_at_last_cut=nver, replay_mismatches=len(rep_bad), paper_mismatches=len(pap_bad),
+                       bad_cuts_rel=rep_bad + pap_bad, legacy_replay_violations=len(legacy_bad))
+
+
 def t_same(rec, base, out):
     n, d = paper_vs_replay.compare(rec.path, CFG)
     out["same"] = dict(branches=n, diff=d, stalled_frames=(rec.times or {}).get("stalled_frames", 0))
@@ -376,6 +438,8 @@ CHECKS = {
                   lambda r: r["decision_diff"] == 0 and ok_common(r)),
     "order_snap": ("стакан по версиям совпадает; решений на недействительном стакане нет", ok_common),
     "future": ("состояние всех веток в момент C совпадает с полным прогоном", lambda r: r["mismatches"] == 0),
+    "meta": ("искажение exchangeInfo после C не меняет состояния REPLAY и PAPER на C",
+             lambda r: r["replay_mismatches"] == 0 and r["paper_mismatches"] == 0),
     "same": ("PAPER = REPLAY; расхождения допустимы только на записях с восстановленными кадрами",
              lambda r: r["diff"] == 0 or r["stalled_frames"] > 0),
 }
@@ -408,6 +472,8 @@ def run_record(path: Path, tests: set[str]) -> dict:
         t_order(rec, base, out)
     if "future" in tests:
         t_future(rec, base, out)
+    if "meta" in tests:
+        t_meta(rec, base, out)
     if "same" in tests:
         t_same(rec, base, out)
     for name, r in out.items():

@@ -100,7 +100,7 @@ def load_open(path: Path, before_ms: int = 60_000, after_ms: int = 120_000, cont
         if start is None:
             start = line_t(line)
         if '"ch":"exchangeInfo"' in line and '"firstOpenTime"' in line:
-            syms = (json.loads(line)["data"] or {}).get("symbols") or []
+            syms = ((d := json.loads(line).get("data")) and isinstance(d, dict) and d.get("symbols")) or []
             if syms and syms[0].get("firstOpenTime"):
                 first_open = int(syms[0]["firstOpenTime"])
         elif '"OPEN_DETECTED"' in line:
@@ -111,15 +111,17 @@ def load_open(path: Path, before_ms: int = 60_000, after_ms: int = 120_000, cont
         return None, [], {}, {}
     t0 = first_open or detected
     lo, hi = min(t0, detected) - before_ms, max(t0, detected) + after_ms
-    entries, info = [], {}
+    entries, info, infos = [], {}, []
     for line in iter_lines(path):
         t = line_t(line)
         if t > hi + 10_000:  # кадры, задержанные остановкой записи, получены позже своего времени
             break
         if '"ch":"exchangeInfo"' in line:
-            syms = (json.loads(line)["data"] or {}).get("symbols") or []
+            syms = ((d := json.loads(line).get("data")) and isinstance(d, dict) and d.get("symbols")) or []
+            if syms and syms[0]:
+                infos.append((t, syms[0]))  # версия справочника и момент её получения (known_at) — для движка
             if syms and t <= t0 + 10_000:
-                info = syms[0]
+                info = syms[0]  # только для отчёта (зоны, комиссии в мета); движок получает версии причинно
         elif t < lo:
             continue
         elif ('"src":"rest","ch":"depth"' in line or '"publicAggreDepths"' in line
@@ -142,8 +144,22 @@ def load_open(path: Path, before_ms: int = 60_000, after_ms: int = 120_000, cont
             spans.append([ft, ft])
     times = dict(exchange_open_ms=first_open, detected_rel_ms=detected - t0, stalled_frames=len(stalled),
                  stall_max_ms=max((e["t"] - frame_time(e, base) for e in stalled), default=0), recon_spans=spans,
-                 record_start_ms=start, contract=broken[0] if broken else "OK")
+                 record_start_ms=start, contract=broken[0] if broken else "OK", infos=infos)
     return t0, events, info, times
+
+
+def feed_causal(engine, events: list, infos: list, until: int | None = None) -> None:
+    """Подать движку события и версии exchangeInfo в порядке времени (решение клиента 19.11, Time Guard): версия
+    справочника доступна движку только с момента её получения (known_at), раньше событий той же миллисекунды —
+    как в PAPER, где ответ REST обрабатывается в момент прихода. Заранее движок ничего не знает."""
+    items = sorted([(t, 0, i) for i, (t, _) in enumerate(infos)] + [(ev[0], 1, j) for j, ev in enumerate(events)])
+    for t, k, i in items:
+        if until is not None and t > until:  # срез для проверки неизменности префикса (p0_stress meta)
+            break
+        if k == 0:
+            engine.on_info(t, infos[i][1], "rest")
+        else:
+            engine.on_event(*events[i])
 
 
 def trajectory(events: list, open_ms: int, ref: float | None = None) -> dict:
@@ -185,10 +201,13 @@ def run_listing(path: Path, args) -> tuple[list[dict], dict]:
     if excluded(symbol):  # решение клиента 13.11: считается и показывается отдельно, в итоги групп не входит
         meta.update(group="unconfirmed", mark=mark_line(symbol))
     opts = Opts(fee=(args.fee or 0.08) / 100, fee_from_info=args.fee is None)
-    engine = MainEngine(args, opts, open_ms, info, cap[0] if cap else None)
-    for t, kind, data, recv, exch in events:
-        engine.on_event(t, kind, data, recv, exch)
+    infos = times.pop("infos")
+    engine = MainEngine(args, opts, None, {}, cap[0] if cap else None, join_ms=times["record_start_ms"])
+    feed_causal(engine, events, infos)
     engine.finish(events[-1][0])
+    if engine.open_ms != open_ms:  # T0 движка (по причинно полученным версиям) обязан совпасть с T0 записи
+        meta.update(status=f"T0_MISMATCH: движок {engine.open_ms} ({engine.t0_state}) ≠ записи {open_ms}", group=None)
+        return [], meta
     meta["traj"] = trajectory(events, open_ms, engine.book.first_ask)
     meta["times"].update(engine.times())
     spans = unreliable_spans(meta["times"], engine.book_gaps, open_ms)

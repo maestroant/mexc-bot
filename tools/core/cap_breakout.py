@@ -931,24 +931,87 @@ class MainEngine(CapEngine):
     EXEC_USDT = (2.0, 5.0, 10.0)
     PRE_MS = 2000  # часы сервера и биржи расходятся на сотни мс: события за 2 с до T0 ещё относятся к открытию
 
-    def __init__(self, cfg, opts: Opts, open_ms: int | None, info: dict, price_cap: float | None = None):
-        super().__init__(cfg, opts, 0.0, open_ms, info, open_ms)
+    # Состояние T0 (решение клиента 19.11, Time Guard): ветки стартуют только в CONFIRMED.
+    UNCONFIRMED, CONFIRMED, LATE_JOIN, CONFLICT = "OPEN_TIME_UNCONFIRMED", "CONFIRMED", "LATE_JOIN", "OPEN_TIME_CONFLICT"
+
+    def __init__(self, cfg, opts: Opts, open_ms: int | None, info: dict, price_cap: float | None = None,
+                 join_ms: int | None = None, join_margin_ms: int = 0):
+        """join_ms — начало наблюдения (старт / перезапуск PAPER, начало записи для REPLAY). firstOpenTime раньше
+        join_ms + join_margin_ms (запас на погрешность поправки часов; PAPER — 250 мс, REPLAY — 0) — LATE_JOIN: открытия
+        процесс не видел, новых входов окна открытия нет. exchangeInfo подаётся on_info(known_at,
+        info) в момент получения; info и open_ms в конструкторе — только для старых диагностических вызовов (знание
+        до потока, source=preset) — пути PAPER и REPLAY их не используют."""
+        super().__init__(cfg, opts, 0.0, None, {}, None)
         self.price_cap = price_cap
+        self.join_ms, self.join_margin_ms = join_ms, join_margin_ms
+        self.t0_state = self.UNCONFIRMED
+        self.t0_log: list[dict] = []  # переходы состояния T0 с причиной (журнал PAPER — событие T0_STATE)
+        self.info_versions: list[dict] = []  # каждая версия exchangeInfo: known_at, firstOpenTime, status, источник
+        self.late_first_open: int | None = None  # firstOpenTime при LATE_JOIN (T0 не назначается)
         self.first_book_ms: int | None = None
         self.first_trade_ms: int | None = None
+        self.first_msg_ms: int | None = None
         self.first_exec: dict[float, tuple[int, float]] = {}  # план USDT → (время, bestAsk)
         self.last_trade_px: float | None = None
         self.book_gaps: list[list] = []  # [начало, конец] интервалов, когда стакан после разрыва версий недействителен
+        if info:
+            self.on_info(join_ms, info, "preset")
+        if open_ms is not None:
+            self.open_ms = self.cand_ms = open_ms
+            self._t0(join_ms, self.CONFIRMED, "T0 задан заранее (preset, диагностика)", open_ms=open_ms)
+
+    def _t0(self, t: int | None, state: str, why: str, **kw) -> None:
+        self.t0_state = state
+        self.t0_log.append(dict(t=t, state=state, why=why, **kw))
 
     def exchange_open_ms(self) -> int | None:
         v = (self.info or {}).get("firstOpenTime")
         return int(v) if v else None
 
+    def on_info(self, known_at: int | None, info: dict, source: str = "rest") -> None:
+        """Версия exchangeInfo пары, полученная в known_at. До старта веток — текущие параметры инструмента. T0 —
+        официальный firstOpenTime: подтверждается первой версией с ним, следует за переносами, пока рынок не открылся
+        (KOR); firstOpenTime раньше начала наблюдения — LATE_JOIN; другой firstOpenTime после открытия рынка —
+        OPEN_TIME_CONFLICT (fail-closed: новые входы запрещены, позиции и выход не трогаются). Позднее знание не меняет
+        уже принятых решений: движок применяет версию только с момента её получения."""
+        if not info:
+            return
+        fo = int(info["firstOpenTime"]) if info.get("firstOpenTime") else None
+        self.info_versions.append(dict(known_at=known_at, first_open=fo, status=info.get("status"), source=source))
+        if self.release is None and self.t0_state != self.CONFLICT:
+            self.info = info
+        if fo is None or self.t0_state in (self.LATE_JOIN, self.CONFLICT):
+            return
+        opened = self.book.first_ask is not None or self.first_trade_ms is not None
+        if self.t0_state == self.UNCONFIRMED:
+            if self.join_ms is not None and fo < self.join_ms + self.join_margin_ms:
+                self.late_first_open = fo
+                self._t0(known_at, self.LATE_JOIN, "firstOpenTime раньше начала наблюдения (с запасом на часы) — "
+                         "открытие не видели, новых входов окна открытия нет", first_open=fo, join_ms=self.join_ms,
+                         margin_ms=self.join_margin_ms, source=source)
+                return
+            self.open_ms = self.cand_ms = fo
+            self._t0(known_at, self.CONFIRMED, "firstOpenTime получен до или во время наблюдения", first_open=fo,
+                     join_ms=self.join_ms, source=source, market_opened=opened)
+        elif fo != self.open_ms:
+            if not opened and self.release is None:
+                old, self.open_ms, self.cand_ms = self.open_ms, fo, fo
+                self._t0(known_at, self.CONFIRMED, "перенос открытия до открытия рынка", first_open=fo, previous=old,
+                         source=source)
+            else:
+                self._t0(known_at, self.CONFLICT, "firstOpenTime изменился после открытия рынка — новые входы "
+                         "запрещены", first_open=fo, t0=self.open_ms, source=source)
+                # новых решений о покупке нет: ожидающие ветки закрываются; заявка, уже отправленная до конфликта
+                # (BUY_SENT / BUY_PENDING / BUY_RESTING), доходит по модели исполнения, позиции и выходы не трогаются
+                for s in self.sims:
+                    if s.state == "SCAN":
+                        s.finish(known_at or self.last_t, "OPEN_TIME_CONFLICT")
+
     def try_start(self, t: int, kind: str, data) -> None:
         # ветки — с T0, но только когда рынок действительно открылся (двусторонний стакан или сделка у T0): биржа
         # переносит открытие (KOR 03.11: firstOpenTime менялся дважды), и старое время не должно запускать ветки
         opened = self.book.first_ask is not None or self.first_trade_ms is not None
-        if self.open_ms is not None and t >= self.open_ms and self.book.valid and opened:
+        if self.t0_state == self.CONFIRMED and t >= self.open_ms and self.book.valid and opened:
             self.release = t
             step, qty_step, band_up, _ = market_params(self.info)
             self.sims = make_main_sims(self.cfg, with_fees(self.opts, self.info), self.open_ms, step, qty_step,
@@ -959,15 +1022,13 @@ class MainEngine(CapEngine):
 
     def on_event(self, t: int, kind: str, data, recv_t: int | None = None, exch_t: int | None = None) -> None:
         book = self.book
-        xo = self.exchange_open_ms()
-        if xo and self.release is None and self.open_ms != xo and book.first_ask is None and self.first_trade_ms is None:
-            self.open_ms = self.cand_ms = xo  # пока рынок не открылся, T0 следует за последним firstOpenTime биржи
+        if self.first_msg_ms is None:
+            self.first_msg_ms = t
         if kind == "deal":
             self.last_trade_px = data[0]
             if book.first_trade is None and self.near_open(t):
-                book.first_trade, self.first_trade_ms = data[0], t  # опоры для ограничения роста и отчёта
-                if self.open_ms is None:
-                    self.open_ms = self.cand_ms = t  # официального времени нет — открытие по первой сделке
+                # опоры для ограничения роста и отчёта; T0 по сделке не назначается (решение 19.11) — только firstOpenTime
+                book.first_trade, self.first_trade_ms = data[0], t
         was_valid = book.valid
         super().on_event(t, kind, data, recv_t, exch_t)
         if was_valid and not book.valid:
@@ -980,9 +1041,7 @@ class MainEngine(CapEngine):
         if not ba > bb > 0:
             return
         if book.first_ask is None:
-            book.first_ask, self.first_book_ms = ba, t
-            if self.open_ms is None:
-                self.open_ms = self.cand_ms = t  # или по первому действительному двустороннему стакану
+            book.first_ask, self.first_book_ms = ba, t  # T0 по стакану не назначается (решение 19.11)
         if len(self.first_exec) < len(self.EXEC_USDT):
             self.track_exec(t, ba)
 
@@ -1003,7 +1062,10 @@ class MainEngine(CapEngine):
     def times(self) -> dict:
         """Отметки времени листинга относительно T0, мс."""
         rel = lambda v: None if v is None or self.open_ms is None else v - self.open_ms  # noqa: E731
-        return dict(t0_ms=self.open_ms, exchange_open_ms=self.exchange_open_ms(),
+        return dict(t0_ms=self.open_ms, t0_state=self.t0_state, t0_log=self.t0_log, join_ms=self.join_ms,
+                    late_first_open=self.late_first_open, info_versions=len(self.info_versions),
+                    info_first_known_at=next((v["known_at"] for v in self.info_versions if v["first_open"]), None),
+                    first_msg_ms=self.first_msg_ms, exchange_open_ms=self.exchange_open_ms(),
                     first_book_rel_ms=rel(self.first_book_ms), first_ask=self.book.first_ask,
                     first_trade_rel_ms=rel(self.first_trade_ms), first_trade=self.book.first_trade,
                     first_exec={f"{u:g}": dict(rel_ms=rel(v[0]), ask=v[1]) for u, v in self.first_exec.items()},
